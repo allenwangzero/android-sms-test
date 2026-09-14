@@ -88,7 +88,7 @@ node scripts/test-pending-storage.cjs /tmp/sms-pending-test/node_modules/fake-in
 
 电脑端自动化检查覆盖认证、配对、多设备任务、请求幂等、状态和数量校验、持久化。另有 8 组浏览器存储逻辑测试，覆盖并发页面、刷新恢复、大批次与失败恢复。纯 Java 测试覆盖 17 项手机配对地址校验，无需 SDK。Android 原生编译与 lint 由 CI 执行。
 
-当前本机已通过上述服务端、存储逻辑和纯 Java 测试，以及浏览器生成/编辑/分页/多设备发送/结果展示联调。手机侧使用模拟客户端验证协议；尚未生成 APK 或完成真机扫码、授权和收件箱写入验证。
+当前本机已通过上述服务端、存储逻辑和纯 Java 测试，以及浏览器生成/编辑/分页/多设备发送/结果展示联调。[GitHub Actions 构建](https://github.com/allenwangzero/android-sms-test/actions/runs/34834333494)已通过 Android 编译、lint 和桌面端测试，并生成 APK。手机侧协议使用模拟客户端验证；真机扫码、授权和收件箱写入仍需验收。
 
 真机验收：
 
