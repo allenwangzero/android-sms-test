@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>短信测试工作台</title><link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="top"><div><span class="eyebrow">SMS TEST WORKSPACE</span><h1>短信测试工作台</h1></div><span id="connection" class="badge">正在连接服务</span></header>
+  <main>
+    <section class="intro"><div><h2>在电脑编排，在手机写入。</h2><p>生成或编辑短信，选择测试机发送。手机预览并确认后，才会写入系统收件箱。</p></div><span class="local-label">局域网 · 无需传文件</span></section>
+    <div id="notice" class="notice" role="status" hidden></div>
+    <div class="layout">
+      <aside>
+        <section class="card pairing"><div class="section-title"><h2>01 / 连接手机</h2><button id="rotate" class="text-button">刷新配对码</button></div><div class="qr-wrap"><img id="qr" alt="手机扫码配对二维码" hidden><p id="qr-placeholder">正在获取配对码…</p></div><p>打开安卓工具，扫描二维码。电脑和手机需在同一局域网。</p><code id="server-url">—</code><small id="expiry">—</small><button id="copy-pairing" class="text-button" disabled>复制配对链接</button><textarea id="pairing-link" rows="3" readonly aria-label="配对链接，可手动复制" hidden></textarea><small id="copy-result" role="status"></small></section>
+        <section class="card"><div class="section-title"><h2>测试设备</h2><span id="device-count" class="badge">0 台</span></div><div id="devices" class="devices"><p class="empty">还没有连接的手机</p></div><small>手机工具需保持前台；超过 10 秒未响应显示离线。</small></section>
+        <p class="network-note">仅在可信测试网络使用。短信通过局域网 HTTP 传输。</p>
+      </aside>
+      <div class="workspace">
+        <section class="card"><div class="section-title"><h2>02 / 编排短信</h2><span id="draft-status" class="muted">草稿仅保存在当前浏览器</span></div>
+          <form id="generator"><div class="generate-grid"><label>生成数量<input id="quantity" type="number" min="1" max="10000" step="1" value="10" required></label><label>统一发送人（可选）<input id="sender-template" maxlength="100" placeholder="留空则随机生成手机号"></label></div><label>内容模板（可选）<textarea id="body-template" rows="2" maxlength="4000" placeholder="留空使用带【测试】标记的随机短信"></textarea></label><div class="generator-footer"><small>支持 {code} 随机 6 位数字、{index} 本次生成序号。自定义内容不添加前缀。</small><button type="submit" class="secondary">随机生成并追加</button></div></form>
+          <div class="table-toolbar"><strong id="message-count">0 条短信</strong><div class="actions"><button id="add" class="secondary">＋ 新增一条</button><button id="clear" class="text-button danger">清空列表</button></div></div>
+          <div class="table-scroll"><table><thead><tr><th class="index-col">序号</th><th class="sender-col">发送人</th><th>短信内容</th><th class="date-col">接收时间（电脑本地时间）</th><th class="delete-col"></th></tr></thead><tbody id="messages"></tbody></table><div id="messages-empty" class="empty big">还没有短信。随机生成一批，或新增一条自定义内容。</div></div>
+          <div class="pagination"><span id="page-info">第 1 / 1 页</span><div class="actions"><button id="previous" class="secondary">上一页</button><button id="next" class="secondary">下一页</button></div></div>
+          <div class="send-bar"><div><strong id="selection-summary">请选择目标手机</strong><p>发送当前列表快照；后续编辑不会影响已发送任务。</p></div><button id="send" class="primary">发送到手机</button></div>
+          <div id="retry-box" class="notice" hidden><p id="retry-description"></p><button id="retry" class="secondary">重试发送原批次</button></div>
+        </section>
+        <section class="card"><div class="section-title"><h2>03 / 写入进度</h2><span class="muted">每 2 秒更新</span></div><div id="jobs"><p class="empty">发送后，任务进度会显示在这里。</p></div></section>
+      </div>
+    </div>
+  </main>
+</body></html>
