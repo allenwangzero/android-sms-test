@@ -1,0 +1,8 @@
+**
+!Dockerfile
+!desktop/
+!desktop/server.py
+!desktop/requirements.txt
+!desktop/static/
+!desktop/static/**
+

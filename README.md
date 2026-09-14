@@ -11,7 +11,47 @@
 5. 手机上检查预览和总条数，临时设为默认短信应用，然后确认写入。
 6. 电脑查看各手机的写入进度和结果。完成后在手机恢复原来的默认短信应用，再用原短信 App 查看。
 
-## 启动电脑端（不需要 Android SDK）
+## 使用 Docker 启动电脑端（推荐）
+
+需要 Docker 和 Docker Compose，无需在电脑安装 Python 或 Android SDK。
+
+1. 将项目根目录的 `.env.example` 复制为 `.env`。
+2. 编辑 `.env`，将 `SMS_ADVERTISE_HOST` 填为电脑的局域网 IPv4，例如 `192.168.1.20`。Mac 可在系统设置 → 网络 → 当前连接中查看；Windows 可运行 `ipconfig` 查看当前 Wi-Fi/以太网的 IPv4。
+3. 在项目根目录执行：
+
+```sh
+docker compose up -d --build
+docker compose logs desktop
+```
+
+复制日志中带 `#token=...` 的完整“电脑管理页面”链接到浏览器。手机与电脑连接同一局域网，在安卓工具中扫描网页上的二维码；不要扫描容器内部地址。
+
+默认使用端口 `8765`。如端口被占用，在 `.env` 中修改 `SMS_PORT` 后重新执行启动命令；Compose 会同步修改监听、映射和二维码端口。电脑防火墙需允许手机访问该端口。电脑 IP 变化后更新 `.env` 并重新启动，手机重新扫码连接。
+
+常用命令：
+
+```sh
+docker compose ps                    # 查看运行和健康状态
+docker compose logs -f desktop       # 持续查看日志
+docker compose down                  # 停止并移除容器，保留数据
+docker compose up -d --build          # 更新镜像并重新启动
+```
+
+配对设备、令牌和任务保存在 `sms-data` 命名卷中，容器重建后保留。`docker compose down -v` 会删除该数据卷，仅在需要清空测试服务数据时使用。Docker 数据卷与原 Python 启动方式的 `.data` 目录独立；切换运行方式不会自动迁移旧数据。电脑编辑草稿仍保存在浏览器中。
+
+如直接使用 `docker run`：
+
+```sh
+docker build -t android-sms-test-desktop .
+docker run -d --name sms-test-desktop --init --restart unless-stopped \
+  -p 8765:8765 -v sms-test-data:/app/.data \
+  android-sms-test-desktop --advertise-host 192.168.1.20
+docker logs sms-test-desktop
+```
+
+将示例 IP 替换为电脑真实局域网 IP。直接运行时也要保持内外端口一致；自定义端口需同时设置 `-p 8876:8876`、`-e SMS_PORT=8876` 和启动参数 `--port 8876`。
+
+## 使用 Python 启动电脑端（不需要 Android SDK）
 
 需要 Python 3.10 或更新版本。Mac / Linux：
 

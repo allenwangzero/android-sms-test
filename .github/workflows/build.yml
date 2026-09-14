@@ -24,6 +24,19 @@ jobs:
       - run: node --check desktop/static/app.js
       - run: npm install --prefix "$RUNNER_TEMP/sms-tests" --ignore-scripts --no-audit --no-fund fake-indexeddb@6.2.5
       - run: node scripts/test-pending-storage.cjs "$RUNNER_TEMP/sms-tests/node_modules/fake-indexeddb"
+  docker:
+    runs-on: ubuntu-latest
+    env:
+      SMS_ADVERTISE_HOST: 192.168.1.20
+      SMS_PORT: '18876'
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose -p sms-ci up -d --build --wait --wait-timeout 60
+      - name: Test server inside Docker image
+        run: docker compose -p sms-ci run --rm --no-deps --entrypoint python -v "$PWD/tests:/app/tests:ro" desktop -m unittest discover -s tests -p 'test_*.py' -v
+      - name: Clean up test containers and data
+        if: always()
+        run: docker compose -p sms-ci down -v
   android:
     runs-on: ubuntu-latest
     steps:

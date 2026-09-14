@@ -1,0 +1,22 @@
+services:
+  desktop:
+    build: .
+    init: true
+    restart: unless-stopped
+    ports:
+      - "${SMS_PORT:-8765}:${SMS_PORT:-8765}"
+    environment:
+      SMS_PORT: "${SMS_PORT:-8765}"
+    command:
+      - --host
+      - 0.0.0.0
+      - --port
+      - "${SMS_PORT:-8765}"
+      - --advertise-host
+      - "${SMS_ADVERTISE_HOST:?请在 .env 中填写电脑的局域网 IPv4 地址 SMS_ADVERTISE_HOST}"
+    volumes:
+      - sms-data:/app/.data
+
+volumes:
+  sms-data:
+

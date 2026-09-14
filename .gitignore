@@ -6,5 +6,6 @@ local.properties
 .venv/
 .data/
 dist/
+.env
 __pycache__/
 *.pyc
