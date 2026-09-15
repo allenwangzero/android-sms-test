@@ -15,6 +15,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlencode, urlsplit
 
+try:
+    from .sms_management import ManagementError, SmsManagement
+except ImportError:  # 直接运行 desktop/server.py
+    from sms_management import ManagementError, SmsManagement
+
 MAX_BODY = 16 * 1024 * 1024
 MAX_COUNT = 100000
 BATCH_SIZE = 500
@@ -33,6 +38,7 @@ TRANSITIONS = {
 STATIC = {"/": ("index.html", "text/html; charset=utf-8"),
           "/index.html": ("index.html", "text/html; charset=utf-8"),
           "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+          "/sms-manager.js": ("sms-manager.js", "text/javascript; charset=utf-8"),
           "/sms-xml.js": ("sms-xml.js", "text/javascript; charset=utf-8"),
           "/style.css": ("style.css", "text/css; charset=utf-8")}
 
@@ -63,7 +69,7 @@ def text_field(value, maximum):
     return isinstance(value, str) and 0 < len(value) <= maximum and bool(value.strip())
 
 
-class Store:
+class Store(SmsManagement):
     def __init__(self, db_path, server_url):
         self.server_url = server_url
         self.lock = threading.RLock()
@@ -89,6 +95,7 @@ class Store:
                 upload_id TEXT NOT NULL, batch_index INTEGER NOT NULL, messages TEXT NOT NULL,
                 PRIMARY KEY (upload_id, batch_index));
         """)
+        self.init_management()
         with self.lock, self.db:
             columns = {row["name"] for row in self.db.execute("PRAGMA table_info(jobs)")}
             if "upload_id" not in columns:
@@ -404,8 +411,12 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/api/device/"):
             with store.lock:
                 store.device(self.token())
-            require(self.headers.get("X-SMS-Protocol") == "3", "请升级安卓工具至 v1.2.0 或更新版本以保留短信附加字段", 426)
+            require(self.headers.get("X-SMS-Protocol") == "4", "请升级安卓工具至 v1.3.0 或更新版本以管理手机短信", 426)
         parts = path.split("/")
+        if method == "GET" and path == "/api/device/sms/requests":
+            return self.send(200, store.pending_management(self.token()))
+        if method == "GET" and len(parts) == 5 and parts[1:4] == ["api", "sms", "requests"]:
+            return self.send(200, store.get_management(parts[4]))
         if method == "GET" and len(parts) == 7 and parts[1:4] == ["api", "device", "jobs"] and parts[5] == "batches":
             require(parts[6].isdigit() and len(parts[6]) <= 6, "分批索引无效")
             return self.send(200, store.device_batch(self.token(), parts[4], int(parts[6])))
@@ -428,6 +439,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(200, store.pairing(True))
             if path == "/api/pair":
                 return self.send(200, store.pair(data))
+            if path == "/api/sms/requests":
+                return self.send(200, store.create_management(data))
+            if len(parts) == 7 and parts[1:5] == ["api", "device", "sms", "requests"] and parts[6] == "status":
+                return self.send(200, store.report_management(self.token(), parts[5], data))
             if path == "/api/uploads":
                 return self.send(200, store.create_upload(data))
             if len(parts) == 6 and parts[1:3] == ["api", "uploads"] and parts[4] == "batches":
@@ -449,7 +464,7 @@ class Handler(BaseHTTPRequestHandler):
     def dispatch(self, method):
         try:
             self.handle_api(method)
-        except ApiError as exc:
+        except (ApiError, ManagementError) as exc:
             self.close_connection = True
             self.send(exc.status, {"error": str(exc)})
         except (TimeoutError, socket.timeout):

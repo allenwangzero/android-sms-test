@@ -30,7 +30,7 @@ class ServerTests(unittest.TestCase):
 
     def call(self, path, data=None, token=None, headers=None):
         connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=3)
-        request_headers = {"Content-Type": "application/json", "X-SMS-Protocol": "3"}
+        request_headers = {"Content-Type": "application/json", "X-SMS-Protocol": "4"}
         if token:
             request_headers["Authorization"] = "Bearer " + token
         request_headers.update(headers or {})
@@ -85,6 +85,32 @@ class ServerTests(unittest.TestCase):
     def report(self, device, job, status, written=0, error=""):
         return self.call(f"/api/device/jobs/{job['id']}/status",
                          {"status": status, "written": written, "error": error}, device["deviceToken"])
+
+    def test_management_http_auth_and_protocol(self):
+        first, second = self.device(), self.device()
+        request = {"requestId": str(uuid.uuid4()), "deviceId": first["deviceId"], "action": "list"}
+        path = "/api/sms/requests"
+        self.assertEqual(self.call(path, request)[0], 401)
+        self.assertEqual(self.call(path, request, first["deviceToken"])[0], 401)
+        status, queued = self.call(path, request, self.admin)
+        self.assertEqual(status, 200)
+        self.assertEqual(queued["status"], "queued")
+        self.assertEqual(self.call(path + "/" + request["requestId"], token=self.admin)[1], queued)
+        device_path = "/api/device/sms/requests"
+        self.assertEqual(self.call(device_path)[0], 401)
+        for protocol in ("1", "2", "3"):
+            self.assertEqual(self.call(device_path, token=first["deviceToken"], headers={"X-SMS-Protocol": protocol})[0], 426)
+        self.assertEqual(self.call(device_path, token=second["deviceToken"])[1], {"request": None})
+        self.assertEqual(self.call(device_path, token=first["deviceToken"])[1]["request"]["id"], request["requestId"])
+        report = {"status": "completed", "count": 0, "processed": 0, "deleted": 0,
+                  "error": "", "result": {"total": 0, "page": 0, "pageSize": 50, "rows": []}}
+        status_path = device_path + "/" + request["requestId"] + "/status"
+        self.assertEqual(self.call(status_path, report, second["deviceToken"])[0], 404)
+        self.assertEqual(self.call(status_path, report, self.admin)[0], 401)
+        self.assertEqual(self.call(status_path, report, first["deviceToken"])[0], 200)
+        self.assertEqual(self.call(status_path, report, first["deviceToken"])[0], 200)
+        self.assertEqual(self.call(device_path, token=first["deviceToken"])[1], {"request": None})
+        self.assertNotIn("sms_requests", self.call("/api/state", token=self.admin)[1])
 
     def test_pair_qr_retry_rotation_expiration(self):
         token = self.pairing()
@@ -299,7 +325,7 @@ class ServerTests(unittest.TestCase):
         for protocol in ("1", "2", ""):
             status, result = self.call("/api/device/jobs", token=device["deviceToken"], headers={"X-SMS-Protocol": protocol})
             self.assertEqual(status, 426)
-            self.assertIn("v1.2.0", result["error"])
+            self.assertIn("v1.3.0", result["error"])
 
     def test_partial_upload_restart_conflicts_and_size_limit(self):
         device = self.device()

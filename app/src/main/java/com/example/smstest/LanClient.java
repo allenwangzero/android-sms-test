@@ -28,6 +28,7 @@ public final class LanClient {
     private static LanClient instance;
     private final Context context;
     private final SharedPreferences prefs;
+    private final SmsManagement management;
     private final ScheduledExecutorService worker = Executors.newSingleThreadScheduledExecutor();
     private String baseUrl;
     private String token;
@@ -59,8 +60,21 @@ public final class LanClient {
         baseUrl = prefs.getString("url", "");
         token = prefs.getString("token", "");
         deviceId = prefs.getString("deviceId", "");
+        management = new SmsManagement(context, prefs, new SmsManagement.Host() {
+            @Override public String deviceId() { return deviceId; }
+            @Override public JSONObject request(String path, JSONObject data) throws Exception {
+                return http(baseUrl, token, path, data);
+            }
+            @Override public void checkActive() throws IOException {
+                if (!foreground || stopped || storageBlocked) throw new IOException("应用已离开前台或本地记录异常，任务停止，不会自动续删");
+            }
+            @Override public void save(String key, String value) throws IOException { LanClient.this.save(key, value); }
+            @Override public void result(String text) { result = text; }
+            @Override public void busy(boolean value) { busy = value; }
+        });
         worker.execute(() -> {
             try {
+                management.recover();
                 for (Map.Entry<String, ?> entry : prefs.getAll().entrySet()) {
                     if (!entry.getKey().startsWith("job:")) continue;
                     JSONObject ledger = new JSONObject((String) entry.getValue());
@@ -88,12 +102,13 @@ public final class LanClient {
     public boolean isBusy() { return busy || storageBlocked; }
     public boolean isWorking() { return busy; }
     public Job getJob() { return current; }
+    public SmsManagement.Pending getDeletion() { return management.pending(); }
     public String getConnection() { return connection; }
     public String getResult() { return result; }
 
     public void pair(String link) {
         worker.execute(() -> {
-            if (current != null || storageBlocked) {
+            if (current != null || management.pending() != null || storageBlocked) {
                 result = "请先完成当前任务，再更换连接。";
                 return;
             }
@@ -159,7 +174,13 @@ public final class LanClient {
     private void tick() {
         if (!foreground || storageBlocked || token.isEmpty()) return;
         try {
+            stopped = false;
             flushResults();
+            management.flush();
+            if (current == null && management.tick()) {
+                connection = "已连接：" + baseUrl;
+                return;
+            }
             JSONObject response = http(baseUrl, token, "/api/device/jobs", null);
             connection = "已连接：" + baseUrl;
             if (response.isNull("job")) { current = null; return; }
@@ -193,7 +214,7 @@ public final class LanClient {
 
     private Job parseJob(String id, JSONObject raw) throws Exception {
         if (!raw.has("batchSize") || !raw.has("batchCount") || !raw.has("preview")) {
-            throw new IOException("电脑端协议不兼容，请升级电脑端和手机 App 至 1.2.0 或更新版本");
+            throw new IOException("电脑端协议不兼容，请升级电脑端和手机 App 至 1.3.0 或更新版本");
         }
         int count = integer(raw, "count");
         if (count < 1 || count > 100000 || integer(raw, "batchSize") != BatchImporter.BATCH_SIZE
@@ -234,9 +255,18 @@ public final class LanClient {
         worker.execute(() -> write(jobId));
     }
 
+    public void confirmDeletion(String requestId, boolean accepted) {
+        worker.execute(() -> {
+            if (storageBlocked || current != null) return;
+            stopped = !foreground;
+            try { management.confirm(requestId, accepted); }
+            catch (Exception error) { result = "删除结果待同步或已停止：" + error.getMessage(); }
+        });
+    }
+
     private void write(String jobId) {
         Job job = current;
-        if (storageBlocked || job == null || !job.id.equals(jobId) || prefs.contains(key(jobId))) return;
+        if (storageBlocked || management.pending() != null || job == null || !job.id.equals(jobId) || prefs.contains(key(jobId))) return;
         busy = true;
         stopped = !foreground;
         BatchImporter.Outcome outcome = BatchImporter.run(job.count, new BatchImporter.Operations() {
@@ -314,12 +344,17 @@ public final class LanClient {
     }
 
     private void save(String key, String value) throws IOException {
-        if (!prefs.edit().putString(key, value).commit()) throw new IOException("任务状态无法持久保存，已停止写入");
+        if (storageBlocked) throw new IOException("本地任务记录异常，已禁止执行");
+        if (!prefs.edit().putString(key, value).commit()) {
+            IOException error = new IOException("任务状态无法持久保存，已停止执行");
+            blockStorage(error);
+            throw error;
+        }
     }
 
     private void blockStorage(Exception error) {
         storageBlocked = true;
-        result = "本地任务记录异常，已停用写入以避免重复：" + error.getMessage();
+        result = "本地任务记录异常，已停用任务执行以避免重复：" + error.getMessage();
     }
 
     private JSONObject http(String base, String bearer, String path, JSONObject data)
@@ -329,7 +364,7 @@ public final class LanClient {
         connection.setConnectTimeout(5000);
         connection.setReadTimeout(10000);
         connection.setRequestProperty("Accept", "application/json");
-        connection.setRequestProperty("X-SMS-Protocol", "3");
+        connection.setRequestProperty("X-SMS-Protocol", "4");
         if (!bearer.isEmpty()) connection.setRequestProperty("Authorization", "Bearer " + bearer);
         try {
             if (data != null) {

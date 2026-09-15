@@ -2,3 +2,5 @@
 #pairing-link[hidden]{display:none}
 
 .metadata-col{width:100px}.metadata-cell{font-size:12px;padding-top:16px;white-space:nowrap}
+
+#sms-manager select{display:block;width:100%;margin-top:6px;padding:10px 11px;border:1px solid #d5dfe4;border-radius:6px;background:white;color:#243c48;font:inherit;font-weight:400}.sm-filters{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin:16px 0}.sm-wrap{flex-wrap:wrap;gap:10px}#sm-notice{margin:16px 0}.sm-table td{max-width:320px;white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px}.sm-table td:nth-child(3){min-width:240px}.sm-table input[type=checkbox]{width:18px;height:18px;accent-color:#15766a}.sm-danger{background:#ad362e;color:white}#sm-meter{width:100%;accent-color:#ad362e}#sms-manager>small{margin-top:14px}@media(max-width:480px){.sm-filters{grid-template-columns:1fr}}

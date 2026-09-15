@@ -1,6 +1,8 @@
 package com.example.smstest;
 
 import android.app.AlertDialog;
+import android.Manifest;
+import android.content.pm.PackageManager;
 import android.app.role.RoleManager;
 import android.content.ActivityNotFoundException;
 import android.content.Intent;
@@ -16,6 +18,7 @@ import android.widget.LinearLayout;
 import android.widget.TextView;
 import androidx.activity.ComponentActivity;
 import androidx.activity.result.ActivityResultLauncher;
+import androidx.activity.result.contract.ActivityResultContracts;
 import com.journeyapps.barcodescanner.ScanContract;
 import com.journeyapps.barcodescanner.ScanOptions;
 import java.text.DateFormat;
@@ -35,7 +38,15 @@ public final class MainActivity extends ComponentActivity {
     private Button restore;
     private Button scan;
     private Button paste;
+    private Button allowRead;
+    private Button delete;
+    private Button cancelDelete;
     private String previewId = "";
+    private final ActivityResultLauncher<String> readPermission = registerForActivityResult(
+            new ActivityResultContracts.RequestPermission(), granted -> {
+                showMessage(granted ? "已授权读取短信，请在电脑读取列表。" : "未获得读取权限，无法读取或删除短信。可在系统应用权限设置中开启短信权限。");
+                render();
+            });
     private final ActivityResultLauncher<ScanOptions> scanner = registerForActivityResult(
             new ScanContract(), result -> {
                 if (result.getContents() != null) client.pair(result.getContents());
@@ -64,7 +75,7 @@ public final class MainActivity extends ComponentActivity {
         heading.setTextSize(26);
         layout.addView(heading);
         TextView description = new TextView(this);
-        description.setText("电脑编辑 → 扫码连接 → 手机确认写入\n保持手机和电脑在同一可信局域网，保持本应用前台。\n\n仅用于测试机。短信追加到系统收件箱，设为已读。本工具不发送真实短信、不支持彩信；写入完成后立即恢复原短信应用。\n");
+        description.setText("电脑编辑 / 读取筛选 → 扫码连接 → 手机确认写入或删除\n保持手机和电脑在同一可信局域网，保持本应用前台。\n\n仅用于测试机。导入短信保留设置的已读、状态及锁定字段。授权读取后，电脑可查看短信并筛选。完整短信列表需临时设为默认短信应用，否则系统可能只返回收件和已发送短信；清空所有短信前也需先设为默认应用。删除需在本机确认且不可恢复。本工具不发送真实短信、不支持彩信；操作完成后恢复原短信应用。\n");
         layout.addView(description);
         connection = text(layout);
         scan = button(layout, "1. 扫描电脑配对二维码", () -> {
@@ -84,6 +95,8 @@ public final class MainActivity extends ComponentActivity {
                     .setPositiveButton("连接", (dialog, which) -> client.pair(input.getText().toString())).show();
         });
         roleStatus = text(layout);
+        allowRead = button(layout, "授权读取短信（仅查看无需设为默认应用）", () ->
+                readPermission.launch(Manifest.permission.READ_SMS));
         makeDefault = button(layout, "2. 临时设为默认短信应用", this::requestDefault);
         status = text(layout);
         confirm = button(layout, "3. 确认写入完整任务", () -> {
@@ -94,6 +107,22 @@ public final class MainActivity extends ComponentActivity {
                     .setMessage("这些记录将追加到系统收件箱。确认一次后每 500 条自动分批导入；请保持前台，失败或离开前台即停止，不会自动续写。")
                     .setNegativeButton("返回检查", null)
                     .setPositiveButton("写入", (dialog, which) -> client.confirm(job.id)).show();
+        });
+        delete = button(layout, "确认删除电脑选择的短信", () -> {
+            SmsManagement.Pending pending = client.getDeletion();
+            if (pending == null || client.isBusy()) return;
+            if (!isDefault() || !canRead()) { showMessage("请先授权读取，并设为默认短信应用"); return; }
+            new AlertDialog.Builder(this).setTitle(pending.modeLabel())
+                    .setMessage("即将永久删除 " + pending.count + " 条手机短信，无法恢复。\n\n"
+                            + ("all".equals(pending.mode) ? "包含所有短信文件夹及锁定短信；不包含彩信。\n" : "范围为本次准备的固定短信列表。\n")
+                            + "准备完成后新收到的短信不在本次删除范围内。\n"
+                            + "确认一次后每 200 条分批删除；显示总进度，失败或离开前台即停止，已删除短信不会恢复。\n\n样例：\n" + pending.preview)
+                    .setNegativeButton("返回检查", null)
+                    .setPositiveButton("永久删除 " + pending.count + " 条", (dialog, which) -> client.confirmDeletion(pending.id, true)).show();
+        });
+        cancelDelete = button(layout, "拒绝并取消本次删除任务", () -> {
+            SmsManagement.Pending pending = client.getDeletion();
+            if (pending != null && !client.isBusy()) client.confirmDeletion(pending.id, false);
         });
         restore = button(layout, "4. 恢复原短信应用", this::restoreDefault);
         preview = text(layout);
@@ -124,6 +153,10 @@ public final class MainActivity extends ComponentActivity {
 
     private boolean isDefault() {
         return getPackageName().equals(Telephony.Sms.getDefaultSmsPackage(this));
+    }
+
+    private boolean canRead() {
+        return checkSelfPermission(Manifest.permission.READ_SMS) == PackageManager.PERMISSION_GRANTED;
     }
 
     private void requestDefault() {
@@ -172,18 +205,25 @@ public final class MainActivity extends ComponentActivity {
         boolean busy = client.isBusy();
         boolean defaultApp = isDefault();
         LanClient.Job job = client.getJob();
-        roleStatus.setText(defaultApp ? "当前：本工具为默认短信应用" : "当前：本工具不是默认短信应用");
+        SmsManagement.Pending pending = client.getDeletion();
+        roleStatus.setText((defaultApp ? "当前：本工具为默认短信应用" : "当前：本工具不是默认短信应用")
+                + (canRead() ? "\n短信读取权限：已授权" : "\n短信读取权限：未授权"));
         connection.setText(client.getConnection());
         status.setText(client.getResult());
         makeDefault.setEnabled(!defaultApp && !busy);
+        allowRead.setEnabled(!canRead() && !busy);
         confirm.setEnabled(defaultApp && !busy && job != null);
+        delete.setEnabled(defaultApp && canRead() && !busy && pending != null);
+        delete.setText(pending == null ? "确认删除电脑选择的短信" : "确认" + pending.modeLabel() + "（" + pending.count + " 条）");
+        cancelDelete.setEnabled(!busy && pending != null);
         restore.setEnabled(!client.isWorking());
-        scan.setEnabled(!busy && job == null);
-        paste.setEnabled(!busy && job == null);
-        String nextId = job == null ? "" : job.id;
+        scan.setEnabled(!busy && job == null && pending == null);
+        paste.setEnabled(!busy && job == null && pending == null);
+        String nextId = pending != null ? "delete:" + pending.id : job == null ? "" : "import:" + job.id;
         if (!nextId.equals(previewId)) {
             previewId = nextId;
-            if (job == null) preview.setText("");
+            if (pending != null) preview.setText(pending.modeLabel() + " · 共 " + pending.count + " 条 · 预览前 10 条\n" + pending.preview);
+            else if (job == null) preview.setText("");
             else {
                 StringBuilder content = new StringBuilder("任务共 " + job.count + " 条 · " + job.batchCount + " 批 · 预览前 20 条\n");
                 DateFormat format = DateFormat.getDateTimeInstance();

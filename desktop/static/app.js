@@ -321,6 +321,7 @@ async function refreshState() {
   try {
     const state = await (await api('/api/state')).json();
     devices = state.devices;
+    if (window.smsManager) window.smsManager.setDevices(devices);
     jobs = state.jobs;
     connected = true;
     $('connection').textContent = '服务已连接';
@@ -609,6 +610,8 @@ async function initialize() {
     if (incomingToken) sessionStorage.setItem(TOKEN_KEY, incomingToken);
   } catch { token = incomingToken || ''; }
   if (incomingToken) history.replaceState(null, '', location.pathname + location.search);
+  if (window.initSmsManager) window.smsManager = window.initSmsManager({ api, uuid, scope: `${location.origin}|${token}` });
+  else if ($('sms-manager')) $('sms-manager').textContent = '手机短信管理模块未能加载，请刷新页面后重试。';
   renderMessages();
   if (!token) notify('请使用启动服务时输出的完整管理链接打开页面（包含 #token=…）。');
   try {

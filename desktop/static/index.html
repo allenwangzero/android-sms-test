@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>短信测试工作台</title><link rel="stylesheet" href="/style.css"><script src="/sms-xml.js" defer></script><script src="/app.js" defer></script>
+  <title>短信测试工作台</title><link rel="stylesheet" href="/style.css"><script src="/sms-xml.js" defer></script><script src="/sms-manager.js" defer></script><script src="/app.js" defer></script>
 </head>
 <body>
   <header class="top"><div><span class="eyebrow">SMS TEST WORKSPACE</span><h1>短信测试工作台</h1></div><span id="connection" class="badge">正在连接服务</span></header>
@@ -27,6 +27,7 @@
           <div id="retry-box" class="notice" hidden><p id="retry-description"></p><button id="retry" class="secondary">重试发送原任务</button> <button id="cancel-upload" class="text-button danger">放弃未提交上传</button></div>
         </section>
         <section class="card"><div class="section-title"><h2>03 / 写入进度</h2><span class="muted">每 2 秒更新</span></div><div id="jobs"><p class="empty">发送后，任务进度会显示在这里。</p></div></section>
+        <section id="sms-manager" class="card"></section>
       </div>
     </div>
   </main>

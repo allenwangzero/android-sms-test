@@ -1,8 +1,8 @@
-# 局域网协议 v3
+# 局域网协议 v4
 
 HTTP JSON，UTF-8。电脑 Python 服务监听 0.0.0.0:8765，电脑页面同源。所有时间是 Unix 毫秒。手机前台每 2 秒轮询；每个完整任务只确认一次，随后依次获取和导入分批短信。失败立即停止，不自动续写。
 
-v3（v1.2.0）需要电脑服务、网页和 APK 同步升级。旧的 POST /api/jobs 已移除；所有 /api/device/ 请求必须携带 `X-SMS-Protocol: 3`，否则返回 426，提示升级。配对接口不变。旧 SQLite 任务仍保留，并按 v3 分页读取，缺失的附加字段由手机应用默认值，服务端不改写历史快照。
+v4（v1.3.0）需要电脑服务、网页和 APK 同步升级。旧的 POST /api/jobs 已移除；所有 /api/device/ 请求必须携带 `X-SMS-Protocol: 4`，否则返回 426，提示升级。配对接口不变。旧 SQLite 任务仍保留，并按 v4 分页读取，缺失的附加字段由手机应用默认值，服务端不改写历史快照。
 
 ## 数据与限制
 
@@ -48,7 +48,7 @@ Authorization: Bearer ADMIN_TOKEN。管理链接 `http://127.0.0.1:8765/#token=A
 ## 手机 API
 
 - POST /api/pair，body `{token:"配对token",name:"设备显示名",clientId:"手机持久UUID"}` → `{deviceId:"uuid",deviceToken:"随机token",name:"..."}`。无需 Authorization，仅凭短时配对 token。相同 clientId 再配对保持设备 ID/token。
-- GET /api/device/jobs，Bearer DEVICE_TOKEN，`X-SMS-Protocol: 3` → `{job:任务元信息加preview或null}`。preview 最多前 20 条短信，不含全量 messages。返回该手机最早未结束任务，更新 lastSeen。
+- GET /api/device/jobs，Bearer DEVICE_TOKEN，`X-SMS-Protocol: 4` → `{job:任务元信息加preview或null}`。preview 最多前 20 条短信，不含全量 messages。返回该手机最早未结束任务，更新 lastSeen。
 - GET /api/device/jobs/ID/batches/INDEX，同样需要设备认证和协议头 → `{jobId:"uuid",index:0,offset:0,total:10001,messages:[短信]}`。只允许任务所属设备读取，状态必须 received/writing；要求 offset = 服务端已确认 written。因此手机必须在每批结束时成功报告总进度，才能读取下一批；终态拒绝读取。
 - POST /api/device/jobs/ID/status，同样需要设备认证和协议头，body `{status:"received|writing|completed|failed|interrupted",written:0,error:""}` → `{ok:true}`。只能修改自己的任务；可重复报告同状态同进度，禁止回退。
 
@@ -57,3 +57,25 @@ Authorization: Bearer ADMIN_TOKEN。管理链接 `http://127.0.0.1:8765/#token=A
 错误：HTTP 4xx/5xx JSON `{error:"中文原因"}`。任务去重以手机本地持久化 jobId 为准。插入前持久化 writing 标记；进程崩溃后报告 interrupted，不自动续写。短信 Provider 与本地存储不是同一个事务：极端崩溃时已写数量可能比记录进度多一条，不保证严格原子 exactly-once。
 
 电脑端 SQLite 保存上传分批、任务、配对设备和 token，重启保留上传进度、去重与反馈。旧数据库新增 jobs.upload_id 列，原有 messages 数据不删除。绑定与传输为局域网 HTTP，限可信测试网络；令牌不是链路加密。不允许跨域访问管理 API，不启用 CORS。
+
+
+## 手机短信读取和删除（v4）
+
+管理请求独立于导入任务持久化在 `sms_requests`，升级旧数据库自动建表，不改动旧导入数据。管理页只单独查询某次请求；`/api/state` 不包含手机短信结果。每设备最多一个 queued/ready/running 管理请求，其余返回 409。requestId 必须为规范小写 UUID，同 ID、规范化同请求重试返回当前结果，异体返回 409；终态保留防止重放。
+
+- POST `/api/sms/requests`，管理员 Bearer。body `{requestId,deviceId,action:"list",filters,page:0}` 或 `{requestId,deviceId,action:"delete",filters,selection}`，返回请求对象本身。
+- GET `/api/sms/requests/ID`，管理员 Bearer，返回同一请求对象，不存在 404。
+- GET `/api/device/sms/requests`，设备 Bearer + 协议 4，返回 `{request:对象或null}`；仅返回本设备活跃请求，并更新心跳。设备对象附带 filters/page/selection。
+- POST `/api/device/sms/requests/ID/status`，设备 Bearer + 协议 4。body 全字段 `{status,count,processed,deleted,error,result}`，返回更新后对象。只允许所属设备报告，异设备返回 404。成功报告和同报告重试均更新心跳。
+
+请求对象 `{id,deviceId,action,status,count:null,processed:0,deleted:0,error:"",result:null}`。提交阶段 count 未知；手机报告后为非负整数。error 最多 2000 字符，result 可以 null。未知字段拒绝；整数拒绝布尔值。
+
+filters 默认 `{sender:"",keyword:"",dateFrom:null,dateTo:null,read:null,status:null,locked:0}`。sender 为精确匹配，最多 100 字符；keyword 为内容子串，最多 4000 字符；空字符串不限制。日期包含两端，为 0–4102444800000 的毫秒整数或 null，开始不能晚于结束；read/locked 为 null 或 0/1；status 为 null 或 -1–255。null 表示不限制。page 从 0 开始，最大 10000000；固定 pageSize=50。
+
+selection 有三种形式：`{mode:"selected",items:[{id:"1",fingerprint:"64位小写SHA256"}]}`、`{mode:"filtered"}`、`{mode:"all"}`。selected 最多 100000 项、至少 1 项，ID 不重复，规范化按数值排序；ID 为 Android 正 64 位整数的十进制字符串，不能有前导零。filtered 根据 filters 生成手机端固定目标快照。all 忽略条件，将 filters 规范化为文本空串、其他 null，包含锁定短信。读取请求不能带 selection；filtered/all 不能带 items。删除请求的 page 统一为 0。
+
+短信预览行 `{id,fingerprint,sender,body,timestamp,type,read,status,locked}`，sender 最多 200 字符、body 最多 2000 字符，手机只截断显示文本，指纹基于原始记录生成。timestamp 为非负 64 位毫秒数；type 为 0–6，read/locked 为 0/1，status 为 -1–255。页面内 ID 不能重复。
+
+读取状态仅 queued → completed/failed。completed 必须返回 `{total,page,pageSize:50,rows}`，count=total，processed=deleted=0，rows 为该页实际条数且最多 50 条。失败可 result=null。
+
+删除状态 queued → ready → running → completed/failed/interrupted；queued/ready 也可转 failed/interrupted/cancelled。准备过程被进程中断可直接 interrupted。ready 必须返回 `{count,preview:[最多10行],selectionMode}`，目标数自此固定，后续 result 可 null（服务器保留已确认预览），不能修改已有预览。手机确认前 processed=deleted=0；确认后 running 进度可重复且不能回退，始终 deleted<=processed<=count；completed 必须 processed=count。失败立即停止，已删除项不回滚，不自动续删。终态只接受完全相同的最后报告幂等重试。服务没有远程确认删除接口，真正删除必须经手机本地确认。
