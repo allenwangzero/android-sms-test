@@ -602,7 +602,34 @@ $('send').addEventListener('click', async () => {
   finally { preparing = false; updateSend(); }
 });
 
+function initializeModuleTabs() {
+  const tabs = [$('tab-write'), $('tab-delete')];
+  function selectTab(index, focus = false) {
+    tabs.forEach((tab, position) => {
+      const active = position === index;
+      tab.setAttribute('aria-selected', String(active));
+      tab.tabIndex = active ? 0 : -1;
+      $(tab.getAttribute('aria-controls')).hidden = !active;
+    });
+    if (focus) tabs[index].focus();
+  }
+  tabs.forEach((tab, index) => {
+    tab.addEventListener('click', () => selectTab(index));
+    tab.addEventListener('keydown', event => {
+      let next;
+      if (event.key === 'ArrowRight') next = (index + 1) % tabs.length;
+      else if (event.key === 'ArrowLeft') next = (index + tabs.length - 1) % tabs.length;
+      else if (event.key === 'Home') next = 0;
+      else if (event.key === 'End') next = tabs.length - 1;
+      else return;
+      event.preventDefault();
+      selectTab(next, true);
+    });
+  });
+}
+
 async function initialize() {
+  initializeModuleTabs();
   const params = new URLSearchParams(location.hash.slice(1));
   const incomingToken = params.get('token');
   try {

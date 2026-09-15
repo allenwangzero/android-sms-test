@@ -5,7 +5,7 @@
   const labels = { queued: '等待手机处理', ready: '等待手机确认删除', running: '手机正在处理', completed: '已完成', failed: '失败，已停止', interrupted: '已中断，停止处理', cancelled: '手机已取消' };
   window.initSmsManager = function ({ api, uuid, scope }) {
     const root = document.getElementById('sms-manager');
-    root.innerHTML = `<div class="section-title"><h2>04 / 手机短信管理</h2><span class="muted">读取、筛选与删除</span></div>
+    root.innerHTML = `<div class="section-title"><h2>手机短信读取与删除</h2><span class="muted">读取、筛选与删除</span></div>
       <p>选择一台手机，点击读取。手机工具需保持前台并授予读取权限；完整列表和清空全部需先临时设为默认短信应用，否则系统可能仅返回收件和已发送短信。删除前会在手机再次确认。</p>
       <label>目标手机<select id="sm-device"><option value="">请选择手机</option></select></label>
       <div class="sm-filters">
