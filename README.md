@@ -6,7 +6,7 @@
 
 1. 电脑启动本地服务，打开终端打印的管理页面链接。
 2. 安卓工具扫描电脑页面上的配对二维码。电脑与手机需要在可互相访问的同一局域网。
-3. 在电脑随机生成短信，或点击“上传 XML 并追加”导入短信文件，再编辑发送人、正文和接收时间。XML 支持 `<smses><sms address="发送人" body="内容" date="毫秒时间戳" type="1" /></smses>` 格式，仅支持收件短信。保留原顺序与内容，全部校验通过并保存后才追加；失败不改动原列表。单文件最多 64 MiB，列表最多 100,000 条。XML 在浏览器解析，点击发送后按原流程分批传输，无需更新 v1.1.0 APK。
+3. 在电脑随机生成短信，或点击“上传 XML 并追加”导入短信文件，再编辑发送人、正文和接收时间。XML 支持 `<smses><sms address="发送人" body="内容" date="毫秒时间戳" type="1" /></smses>` 格式，仅支持收件短信。保留原顺序与内容，全部校验通过并保存后才追加；失败不改动原列表。单文件最多 64 MiB，列表最多 100,000 条。XML 在浏览器解析，点击发送后按原流程分批传输，元数据写入需要电脑端与 APK 同时更新至 v1.2.0。
 4. 选择一台或多台已配对手机，点击发送；电脑按 500 条一批上传完整列表快照，全部上传完成后才创建手机任务。
 5. 手机上检查预览、总条数和批次数，临时设为默认短信应用。只需确认一次，手机就会逐批下载并按原顺序写入，无需每批重复确认。
 6. 电脑和手机显示累计写入进度。任何一批下载、写入或进度同步失败都会停止整个任务，已写入的短信保留。完成后在手机恢复原来的默认短信应用，再用原短信 App 查看。
@@ -75,7 +75,7 @@ Windows：双击 `start-desktop.cmd`，或在命令提示符中执行它。
 
 ## 取得安卓安装包：在 CI 构建
 
-公开安装包见 [GitHub Releases](https://github.com/allenwangzero/android-sms-test/releases)。自动分批功能使用协议 v2，需要电脑端与 APK 同时升级至 v1.1.0 或更新版本；旧 APK 无法获取新服务中的任务。已有电脑端数据库会保留，升级前请完成或停止正在执行的手机任务。
+公开安装包见 [GitHub Releases](https://github.com/allenwangzero/android-sms-test/releases)。元数据导入使用协议 v3，需要电脑端与 APK 同时升级至 v1.2.0 或更新版本；旧 APK 无法获取新服务中的任务。已有电脑端数据库会保留，升级前请完成或停止正在执行的手机任务。
 
 本机不需要安装 Android SDK。项目已提供 `.github/workflows/build.yml`：
 
@@ -95,6 +95,9 @@ Windows：双击 `start-desktop.cmd`，或在命令提示符中执行它。
 - 每个完整任务 1–100000 条，自动拆为每批最多 500 条；每条发送人 1–100 字符，正文 1–4000 字符，时间为有效日期。单次 HTTP 请求最多 16 MiB，完整列表的紧凑 JSON 数据最多 256 MiB，长正文可能先达到大小上限。
 - 发送人是短信地址，可填测试号码或字母标识；不会创建通讯录联系人，最终显示由手机短信 App 决定。
 - 随机内容默认带 `【测试】` 标记。自定义内容按编辑后的原文写入，不会被工具自动改写。
+- XML 中的 `protocol`、`type`、`subject`、`service_center`、`read`、`status`、`locked` 会随原始短信保存、传输并写入 Android；继续仅接受 `type="1"` 收件短信。电脑列表与手机确认预览展示 `read`、`status`、`locked` 的含义和数值。
+- 未提供元数据时默认 `type=1`、`protocol=0`、`read=1`、`status=-1`、`locked=0`，`subject` 和 `service_center` 为 null。XML 中可空属性的 `"null"` 转为真正空值；Android 写入时 `seen` 与 `read` 一致。
+- `toa`、`sc_toa` 在 Android 标准短信表中没有对应列，仅接受缺省或 null，非空时明确拒绝导入，不会静默丢弃。它们的空值保留在任务中，不向系统提交未知列。依据：[AOSP 短信表定义](https://android.googlesource.com/platform/packages/providers/TelephonyProvider/+/refs/heads/main/src/com/android/providers/telephony/MmsSmsDatabaseHelper.java)。
 - 电脑修改草稿不会改变已经开始上传或已发送的任务。需要新内容时发送新的完整任务。
 - 电脑发送仅代表任务已创建，手机必须确认才写入。手机号不是网络短信接收目标，不会产生运营商短信费用。
 - 手机保持工具在前台以接收任务、执行写入和反馈结果；不实现后台常驻服务。
@@ -144,6 +147,7 @@ node scripts/test-xml-import.cjs /tmp/sms-pending-test/node_modules/jsdom
 4. 生成 12,345 条，手机确认一次，验证按 25 批处理、总进度与内容顺序一致；旋转屏幕不会重新确认或重复写入。
 5. 写入较大批次时切换默认短信应用或强制结束进程，检查部分结果/中断提示，不自动续写。
 6. 恢复原默认短信应用，确认能查看新增记录；按接收日期查找，过去时间的短信可能不在顶部。
-7. 中途断开 Wi-Fi 或退出前台，确认停止整个任务；恢复网络只同步结果，不自动续写。电脑上传到一半刷新页面，重试应只补充缺失批次，并且仅创建一组任务。
+7. 导入 `read=0`、`status=64`、`locked=1` 且包含非空 `subject/service_center/protocol` 的测试短信，核对电脑、手机预览和系统数据库字段一致，再验证 null 值写入。
+8. 中途断开 Wi-Fi 或退出前台，确认停止整个任务；恢复网络只同步结果，不自动续写。电脑上传到一半刷新页面，重试应只补充缺失批次，并且仅创建一组任务。
 
 接口定义见 [PROTOCOL.md](PROTOCOL.md)。安卓平台依据：[Telephony](https://developer.android.com/reference/android/provider/Telephony)、[默认应用角色](https://developer.android.com/reference/android/app/role/RoleManager)。

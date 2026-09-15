@@ -30,7 +30,7 @@ class ServerTests(unittest.TestCase):
 
     def call(self, path, data=None, token=None, headers=None):
         connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=3)
-        request_headers = {"Content-Type": "application/json", "X-SMS-Protocol": "2"}
+        request_headers = {"Content-Type": "application/json", "X-SMS-Protocol": "3"}
         if token:
             request_headers["Authorization"] = "Bearer " + token
         request_headers.update(headers or {})
@@ -236,6 +236,70 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(collected, list(range(count)))
         self.assertEqual(self.report(device, job, "completed", count)[0], 200)
         self.assertEqual(self.get_batch(device, job, 20)[0], 409)
+
+    def test_metadata_snapshot_preview_batches_and_restart(self):
+        device = self.device()
+        request, _ = self.start_upload([device], 501)
+        upload = request["requestId"]
+        metadata = {"type": 1, "protocol": 255, "subject": "主题 📨", "service_center": "+639170000130",
+                    "read": 0, "status": 32, "locked": 1, "toa": None, "sc_toa": None}
+        messages = [dict(self.message(i), **metadata) for i in range(501)]
+        messages[1].update(protocol=None, subject=None, service_center=None)
+        messages[2].update(subject="", service_center="")
+        messages[3] = self.message(3)
+        original = json.dumps(messages, ensure_ascii=False)
+        self.assertEqual(self.put_batch(upload, 0, messages[:500])[0], 200)
+        self.assertEqual(self.put_batch(upload, 1, messages[500:])[0], 200)
+        self.assertEqual(self.put_batch(upload, 0, messages[:500])[0], 200)
+        changed = [dict(message) for message in messages[:500]]
+        changed[0]["locked"] = 0
+        self.assertEqual(self.put_batch(upload, 0, changed)[0], 409)
+        self.assertEqual(json.dumps(messages, ensure_ascii=False), original)
+        job = self.commit(upload)[1]["jobs"][0]
+        self.assertEqual(self.call("/api/device/jobs", token=device["deviceToken"])[1]["job"]["preview"], messages[:20])
+        self.assertEqual(self.report(device, job, "received")[0], 200)
+        self.assertEqual(self.get_batch(device, job, 0)[1]["messages"], messages[:500])
+        self.assertEqual(self.report(device, job, "writing", 500)[0], 200)
+        self.assertEqual(self.get_batch(device, job, 1)[1]["messages"], messages[500:])
+        reopened = Store(self.db_path, self.store.server_url)
+        try:
+            self.assertEqual(reopened.pending(device["deviceToken"])["job"]["preview"], messages[:20])
+            self.assertEqual(reopened.device_batch(device["deviceToken"], job["id"], 1)["messages"], messages[500:])
+            restored = reopened.db.execute("SELECT messages FROM upload_batches WHERE upload_id=? ORDER BY batch_index", (upload,)).fetchall()
+            self.assertEqual([message for row in restored for message in json.loads(row["messages"])], messages)
+        finally:
+            reopened.db.close()
+
+    def test_metadata_validation_and_old_protocol_rejected(self):
+        device = self.device()
+        request, _ = self.start_upload([device], 1)
+        invalid = {"type": [True, 0, 2, 3, 4, 5, 6, 7, None, "1", 1.0],
+                   "protocol": [True, -1, 256, "0", 0.0],
+                   "read": [True, -1, 2, None, "0", 0.0],
+                   "status": [True, -2, 256, None, "32", 32.0],
+                   "locked": [False, -1, 2, None, "1", 1.0],
+                   "subject": [False, 1, "x" * 4001, "\ud800"],
+                   "service_center": [False, 1, "x" * 101],
+                   "toa": [0, "null", "145", False], "sc_toa": [0, "null", "145", False],
+                   "unknown": [None]}
+        for field, values in invalid.items():
+            for value in values:
+                with self.subTest(field=field, value=repr(value)[:30]):
+                    status, result = self.put_batch(request["requestId"], 0, [dict(self.message(), **{field: value})])
+                    self.assertEqual(status, 400)
+                    if field in ("toa", "sc_toa"):
+                        self.assertIn("Android 标准短信数据库", result["error"])
+        missing = self.message()
+        del missing["body"]
+        self.assertEqual(self.put_batch(request["requestId"], 0, [missing])[0], 400)
+        for sms_type in (1,):
+            for sms_status in (-1, 0, 32, 64, 255):
+                snapshot, _ = Store.validate_messages([dict(self.message(), type=sms_type, status=sms_status)])
+                self.assertEqual(json.loads(snapshot)[0]["status"], sms_status)
+        for protocol in ("1", "2", ""):
+            status, result = self.call("/api/device/jobs", token=device["deviceToken"], headers={"X-SMS-Protocol": protocol})
+            self.assertEqual(status, 426)
+            self.assertIn("v1.2.0", result["error"])
 
     def test_partial_upload_restart_conflicts_and_size_limit(self):
         device = self.device()

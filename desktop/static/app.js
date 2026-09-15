@@ -150,6 +150,7 @@ async function loadDraft() {
       !(item.timestamp === null || (Number.isInteger(item.timestamp) && item.timestamp >= 0 && item.timestamp <= 4102444800000)))) {
       throw new Error('草稿格式不正确');
     }
+    stored = stored.map((item, index) => normalizeSmsMetadata(item, index));
     messages = stored;
     if (migrate) {
       await draftOperation('write', stored);
@@ -224,6 +225,18 @@ function renderMessages() {
         saveDraft();
       });
       cell.append(input);
+      row.append(cell);
+    }
+    const metadata = normalizeSmsMetadata(message, index);
+    const statuses = { '-1': '无状态报告', 0: '完成', 32: '等待', 64: '失败' };
+    for (const [field, label] of [
+      ['type', '收件'],
+      ['read', metadata.read ? '已读' : '未读'],
+      ['status', statuses[metadata.status] || '状态码'],
+      ['locked', metadata.locked ? '已锁定' : '未锁定'],
+    ]) {
+      const cell = element('td', 'metadata-cell', `${label}（${metadata[field]}）`);
+      cell.setAttribute('data-field', field);
       row.append(cell);
     }
     const removeCell = element('td');
@@ -364,9 +377,10 @@ async function validateMessages(records) {
   let bytes = 2;
   const encoder = new TextEncoder();
   for (let index = 0; index < records.length; index++) {
-    const message = records[index];
-    if (!hasContent(message.sender) || [...message.sender].length > 100) throw new Error(`第 ${index + 1} 条发送人需为 1–100 个字符。`);
-    if (!hasContent(message.body) || [...message.body].length > 4000) throw new Error(`第 ${index + 1} 条内容需为 1–4000 个字符。`);
+    const message = normalizeSmsMetadata(records[index], index);
+    records[index] = message;
+    if (typeof message.sender !== 'string' || !hasContent(message.sender) || [...message.sender].length > 100) throw new Error(`第 ${index + 1} 条发送人需为 1–100 个字符。`);
+    if (typeof message.body !== 'string' || !hasContent(message.body) || [...message.body].length > 4000) throw new Error(`第 ${index + 1} 条内容需为 1–4000 个字符。`);
     if (!Number.isInteger(message.timestamp) || message.timestamp < 0 || message.timestamp > 4102444800000) throw new Error(`第 ${index + 1} 条接收时间无效，请使用 1970–2100 年范围的时间。`);
     bytes += encoder.encode(JSON.stringify(message)).byteLength + (index ? 1 : 0);
     if (bytes > MAX_TASK_BYTES) throw new Error('完整列表超过 256 MiB，请减少短信数量或缩短内容。');
@@ -382,6 +396,7 @@ function showUploadProgress(completed, count, committing = false) {
 }
 
 async function uploadPayload(payload, onStarted) {
+  await validateMessages(payload.messages);
   const batchCount = Math.ceil(payload.messages.length / BATCH_SIZE);
   showUploadProgress(0, batchCount);
   const upload = await (await api('/api/uploads', { method: 'POST', body: JSON.stringify({
@@ -527,7 +542,7 @@ $('generator').addEventListener('submit', async event => {
       const code = String(randomNumber(100000, 999999));
       const body = template ? template.replaceAll('{code}', code).replaceAll('{index}', String(index)) : `【测试】您的验证码为 ${code}，本短信仅用于测试。序号 ${index}。`;
       if ([...body].length > 4000) throw new Error(`第 ${index} 条模板展开后超过 4000 字符，请缩短内容。`);
-      const message = { sender: sender || `13${randomNumber(0, 9)}${String(randomNumber(0, 99999999)).padStart(8, '0')}`, body, timestamp: Date.now() - randomNumber(0, 7 * 24 * 60 * 60) * 1000 };
+      const message = normalizeSmsMetadata({ sender: sender || `13${randomNumber(0, 9)}${String(randomNumber(0, 99999999)).padStart(8, '0')}`, body, timestamp: Date.now() - randomNumber(0, 7 * 24 * 60 * 60) * 1000 });
       draftBytes += encoder.encode(JSON.stringify(message)).byteLength + (messages.length + additions.length ? 1 : 0);
       if (draftBytes > MAX_TASK_BYTES) throw new Error('生成后的列表将超过 256 MiB，未追加本次内容；请减少数量或缩短模板。');
       additions.push(message);
@@ -544,7 +559,7 @@ $('generator').addEventListener('submit', async event => {
 });
 $('add').addEventListener('click', () => {
   if (!draftLoaded || generating || importing || messages.length >= MAX_COUNT) return;
-  messages.push({ sender: '', body: '', timestamp: Date.now() });
+  messages.push(normalizeSmsMetadata({ sender: '', body: '', timestamp: Date.now() }));
   page = Math.floor((messages.length - 1) / PAGE_SIZE);
   saveDraft(); renderMessages();
   $('messages').lastElementChild.querySelector('input').focus();

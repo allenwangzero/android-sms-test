@@ -5,6 +5,7 @@ import android.content.Context;
 import android.net.Uri;
 import android.provider.Telephony;
 import java.io.IOException;
+import java.util.Map;
 
 /** One provider insertion; LanClient owns the durable batch state and worker. */
 public final class SmsWriter {
@@ -15,13 +16,15 @@ public final class SmsWriter {
             throw new SecurityException("默认短信应用已切换，写入停止");
         }
         ContentValues values = new ContentValues();
-        values.put(Telephony.Sms.ADDRESS, record.sender);
-        values.put(Telephony.Sms.BODY, record.body);
-        values.put(Telephony.Sms.DATE, record.timestamp);
-        values.put(Telephony.Sms.TYPE, Telephony.Sms.MESSAGE_TYPE_INBOX);
-        values.put(Telephony.Sms.READ, 1);
-        values.put(Telephony.Sms.SEEN, 1);
-        Uri inserted = context.getContentResolver().insert(Telephony.Sms.Inbox.CONTENT_URI, values);
+        for (Map.Entry<String, Object> entry : record.providerValues().entrySet()) {
+            Object value = entry.getValue();
+            if (value == null) values.putNull(entry.getKey());
+            else if (value instanceof String) values.put(entry.getKey(), (String) value);
+            else if (value instanceof Integer) values.put(entry.getKey(), (Integer) value);
+            else if (value instanceof Long) values.put(entry.getKey(), (Long) value);
+            else throw new IOException("短信字段类型无效：" + entry.getKey());
+        }
+        Uri inserted = context.getContentResolver().insert(Telephony.Sms.CONTENT_URI, values);
         if (inserted == null) throw new IOException("系统短信数据库未返回写入结果");
     }
 }

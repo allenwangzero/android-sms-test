@@ -1,5 +1,31 @@
 'use strict';
 
+globalThis.normalizeSmsMetadata = function normalizeSmsMetadata(record, index = 0) {
+  const fail = message => { throw new Error(`第 ${index + 1} 条短信：${message}`); };
+  if (!record || typeof record !== 'object' || Array.isArray(record)) fail('记录必须是短信对象。');
+  const result = { ...record };
+  if (Object.hasOwn(record, 'type') && record.type !== 1) fail('仅支持 type="1" 的收件短信。');
+  const integers = { type: [1, 1, 1], protocol: [0, 255, 0], read: [0, 1, 1], status: [-1, 255, -1], locked: [0, 1, 0] };
+  for (const [field, [min, max, fallback]] of Object.entries(integers)) {
+    const value = Object.hasOwn(record, field) ? record[field] : fallback;
+    if (!(field === 'protocol' && value === null) && (!Number.isInteger(value) || value < min || value > max)) {
+      fail(`${field} 必须是 ${min}–${max} 范围内的整数${field === 'protocol' ? '或 null' : ''}。`);
+    }
+    result[field] = value;
+  }
+  for (const [field, limit] of Object.entries({ subject: 4000, service_center: 100 })) {
+    const value = Object.hasOwn(record, field) ? record[field] : null;
+    if (value !== null && (typeof value !== 'string' || [...value].length > limit)) fail(`${field} 必须是 null 或最多 ${limit} 个字符的文本。`);
+    result[field] = value;
+  }
+  for (const field of ['toa', 'sc_toa']) {
+    const value = Object.hasOwn(record, field) ? record[field] : null;
+    if (value !== null) fail(`${field} 在标准 Android 短信库中没有对应字段，仅支持 null。`);
+    result[field] = null;
+  }
+  return result;
+};
+
 globalThis.parseSmsXml = function parseSmsXml(text) {
   const maxCount = 100000;
   const maxTimestamp = 4102444800000;
@@ -43,7 +69,6 @@ globalThis.parseSmsXml = function parseSmsXml(text) {
     for (const field of ['address', 'body', 'date', 'type']) {
       if (!node.hasAttribute(field)) fail(index, `缺少 ${field} 属性。`);
     }
-    if (node.getAttribute('type') !== '1') fail(index, '仅支持 type="1" 的收件短信。');
 
     const sender = node.getAttribute('address');
     const body = node.getAttribute('body');
@@ -54,7 +79,20 @@ globalThis.parseSmsXml = function parseSmsXml(text) {
     if (!/^\d+$/.test(date) || !Number.isSafeInteger(timestamp) || timestamp > maxTimestamp) {
       fail(index, 'date 必须是 0–4102444800000 范围内的十进制整数毫秒时间戳。');
     }
-    records.push({ sender, body, timestamp });
+    const metadata = {};
+    for (const field of ['type', 'protocol', 'read', 'status', 'locked']) {
+      if (!node.hasAttribute(field)) continue;
+      const value = node.getAttribute(field);
+      if (field === 'protocol' && value === 'null') metadata[field] = null;
+      else {
+        if (!/^-?\d+$/.test(value)) fail(index, `${field} 必须是十进制整数${field === 'protocol' ? '或 null' : ''}。`);
+        metadata[field] = Number(value);
+      }
+    }
+    for (const field of ['subject', 'service_center', 'toa', 'sc_toa']) {
+      if (node.hasAttribute(field)) metadata[field] = node.getAttribute(field) === 'null' ? null : node.getAttribute(field);
+    }
+    records.push(normalizeSmsMetadata({ sender, body, timestamp, ...metadata }, index));
   }
 
   if (!records.length) throw new Error('XML 中没有可导入的短信。');

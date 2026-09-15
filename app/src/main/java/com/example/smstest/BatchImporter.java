@@ -58,6 +58,12 @@ public final class BatchImporter {
                 || record.sender.trim().isEmpty() || record.body.trim().isEmpty()
                 || record.sender.codePointCount(0, record.sender.length()) > 100
                 || record.body.codePointCount(0, record.body.length()) > 4000
+                || record.type != 1
+                || (record.protocol != null && (record.protocol < 0 || record.protocol > 255))
+                || (record.subject != null && record.subject.codePointCount(0, record.subject.length()) > 4000)
+                || (record.serviceCenter != null && record.serviceCenter.codePointCount(0, record.serviceCenter.length()) > 100)
+                || record.read < 0 || record.read > 1 || record.locked < 0 || record.locked > 1
+                || record.status < -1 || record.status > 255
                 || record.timestamp < 0 || record.timestamp > 4102444800000L) {
             throw new IOException("短信内容无效，已停止任务");
         }

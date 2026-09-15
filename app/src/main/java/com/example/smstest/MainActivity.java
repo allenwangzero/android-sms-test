@@ -191,6 +191,7 @@ public final class MainActivity extends ComponentActivity {
                     SmsRecord record = job.preview.get(i);
                     content.append("\n").append(i + 1).append(". ").append(record.sender)
                             .append("\n").append(format.format(new Date(record.timestamp)))
+                            .append("\n").append(record.previewMetadata())
                             .append("\n").append(record.body).append("\n");
                 }
                 preview.setText(content.toString());

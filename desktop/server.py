@@ -18,6 +18,11 @@ from urllib.parse import urlencode, urlsplit
 MAX_BODY = 16 * 1024 * 1024
 MAX_COUNT = 100000
 BATCH_SIZE = 500
+REQUIRED_SMS_FIELDS = {"sender", "body", "timestamp"}
+SMS_INTEGER_RANGES = {"type": (1, 1), "protocol": (0, 255), "read": (0, 1),
+                      "status": (-1, 255), "locked": (0, 1)}
+SMS_TEXT_LIMITS = {"subject": 4000, "service_center": 100}
+SMS_FIELDS = REQUIRED_SMS_FIELDS | SMS_INTEGER_RANGES.keys() | SMS_TEXT_LIMITS.keys() | {"toa", "sc_toa"}
 MAX_SNAPSHOT = 256 * 1024 * 1024
 TERMINAL = {"completed", "failed", "interrupted"}
 TRANSITIONS = {
@@ -200,11 +205,24 @@ class Store:
         require(isinstance(messages, list), "短信须为数组")
         for message in messages:
             require(isinstance(message, dict), "短信格式错误")
-            require(set(message) == {"sender", "body", "timestamp"}, "短信字段必须为 sender/body/timestamp")
+            require(REQUIRED_SMS_FIELDS <= message.keys(), "短信必须包含 sender/body/timestamp")
+            require(message.keys() <= SMS_FIELDS, "短信包含不支持的字段")
             require(text_field(message["sender"], 100), "发送人须为 1–100 个字符")
             require(text_field(message["body"], 4000), "内容须为 1–4000 个字符")
             require(type(message["timestamp"]) is int and 0 <= message["timestamp"] <= 4102444800000,
                     "短信时间须为有效毫秒整数")
+            for field, (minimum, maximum) in SMS_INTEGER_RANGES.items():
+                if field not in message or (field == "protocol" and message[field] is None):
+                    continue
+                value = message[field]
+                require(type(value) is int and minimum <= value <= maximum,
+                        f"短信 {field} 须为 {minimum}–{maximum} 整数")
+            for field, maximum in SMS_TEXT_LIMITS.items():
+                value = message.get(field)
+                require(value is None or (isinstance(value, str) and len(value) <= maximum),
+                        f"短信 {field} 须为 null 或最多 {maximum} 个字符的字符串")
+            for field in ("toa", "sc_toa"):
+                require(message.get(field) is None, f"Android 标准短信数据库没有 {field} 列，仅支持 null")
         try:
             snapshot = json.dumps(messages, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
             size = len(snapshot.encode("utf-8"))
@@ -386,7 +404,7 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/api/device/"):
             with store.lock:
                 store.device(self.token())
-            require(self.headers.get("X-SMS-Protocol") == "2", "请升级安卓工具至支持分批导入的版本", 426)
+            require(self.headers.get("X-SMS-Protocol") == "3", "请升级安卓工具至 v1.2.0 或更新版本以保留短信附加字段", 426)
         parts = path.split("/")
         if method == "GET" and len(parts) == 7 and parts[1:4] == ["api", "device", "jobs"] and parts[5] == "batches":
             require(parts[6].isdigit() and len(parts[6]) <= 6, "分批索引无效")

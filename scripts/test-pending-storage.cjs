@@ -25,7 +25,7 @@ async function tab(origin = 'http://127.0.0.1:8765', adminToken = 'admin-a') {
   }, document: {
     getElementById(id) { if (!nodes.has(id)) nodes.set(id, {}); return nodes.get(id); },
   } });
-  vm.runInContext(storageSource + draftSource, context);
+  vm.runInContext(fs.readFileSync(path.join(__dirname, '../desktop/static/sms-xml.js'), 'utf8') + storageSource + draftSource, context);
   context.adminTokenForTest = adminToken;
   vm.runInContext('token = adminTokenForTest', context);
   await vm.runInContext('openPendingStorage()', context);
@@ -242,6 +242,32 @@ async function run() {
   assert.equal((await draftReload.restoreDraft()).length, 100000);
   draftReload.close();
   console.log('PASS: old localStorage draft migrates safely and 100000-record IndexedDB draft survives reload');
+
+  const metadataTab = await tab('http://127.0.0.1:8767', 'metadata');
+  const rich = batch('metadata-snapshot');
+  Object.assign(rich.messages[0], { type: 1, protocol: null, subject: 'A&B', service_center: '+63917', read: 0, status: 64, locked: 1, toa: null, sc_toa: null });
+  await metadataTab.draft('write', rich.messages);
+  const richRestored = await metadataTab.restoreDraft();
+  assert.deepEqual(JSON.parse(JSON.stringify(richRestored)), rich.messages);
+  await metadataTab.submit(rich, 'network');
+  rich.messages[0].read = 1;
+  const pendingRich = await metadataTab.operation('read');
+  assert.equal(pendingRich.messages[0].read, 0);
+  await metadataTab.submit(pendingRich);
+  const sentRich = metadataTab.requests().find(request => request.path.endsWith('/batches/0')).body.messages[0];
+  assert.equal(sentRich.read, 0);
+  assert.equal(sentRich.locked, 1);
+  assert.equal(sentRich.status, 64);
+  assert.equal(sentRich.protocol, null);
+  assert.equal(sentRich.subject, 'A&B');
+  assert.equal(sentRich.service_center, '+63917');
+  for (const [field, value] of [['read', true], ['read', null], ['status', '64'], ['locked', 2], ['protocol', 256], ['subject', 5], ['toa', 'null'], ['sc_toa', 0]]) {
+    await assert.rejects(metadataTab.validate([{ sender: 'TEST', body: 'test', timestamp: 0, [field]: value }]), new RegExp(field));
+  }
+  await metadataTab.draft('write', [{sender: 'A', body: 'B', timestamp: 0, read: '0'}]);
+  assert.equal((await metadataTab.restoreDraft())[0].read, 0, 'Invalid metadata draft must not replace the valid in-memory draft');
+  metadataTab.close();
+  console.log('PASS: metadata survives draft recovery, immutable snapshot, retry and transfer; invalid values are rejected');
 
   const brokenStorageTab = await tab('http://127.0.0.1:8765', 'broken-storage');
   brokenStorageTab.close();

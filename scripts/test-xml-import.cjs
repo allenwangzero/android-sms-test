@@ -22,6 +22,25 @@ async function main() {
   assert.equal(w.parseSmsXml(xml(record.replace('hello', ' A&amp;B &lt;tag&gt;&#10;😀 ')))[0].body, ' A&B <tag>\n😀 ');
   assert.equal(w.parseSmsXml('<?xml version="1.0" encoding="UTF-8"?>' + xml(record))[0].body, 'hello');
   for (const bad of ['', '<smses>', '<root/>', xml('<mms/>'), '<!DOCTYPE smses>' + xml(record), '<?test x?>' + xml(record), xml(record, ' count="2000"'), xml(record.replace('type="1"', 'type="2"')), xml(record.replace('address="Maya"', '')), xml(record.replace('hello', '&#133; ')), xml(record.replace('1789281245486', '1e3')), xml(record.replace('1789281245486', '4102444800001')), xml(record.replace('hello', 'a'.repeat(4001)))]) reject(bad, /XML|短信|第 1/);
+  const enrichedRecord = record.replace('/>', ' protocol="null" subject="A&amp;B" service_center="+63917" read="0" status="64" locked="1" toa="null" sc_toa="null"/>');
+  const metadata = w.parseSmsXml(xml(enrichedRecord))[0];
+  assert.equal(metadata.type, 1);
+  assert.equal(metadata.protocol, null);
+  assert.equal(metadata.subject, 'A&B');
+  assert.equal(metadata.service_center, '+63917');
+  assert.equal(metadata.read, 0);
+  assert.equal(metadata.status, 64);
+  assert.equal(metadata.locked, 1);
+  assert.equal(metadata.toa, null);
+  assert.equal(metadata.sc_toa, null);
+  assert.equal(parsed[0].protocol, 0);
+  assert.equal(parsed[0].subject, null);
+  assert.equal(parsed[0].read, 1);
+  assert.equal(parsed[0].status, -1);
+  assert.equal(parsed[0].locked, 0);
+  for (const [field, value] of [['read', 'null'], ['read', 'true'], ['read', ''], ['read', '2'], ['locked', '-1'], ['status', '256'], ['status', '1.0'], ['protocol', '-1'], ['protocol', '256'], ['toa', '145'], ['sc_toa', ''], ['subject', 'a'.repeat(4001)], ['service_center', 'a'.repeat(101)]]) {
+    reject(xml(record.replace('/>', ` ${field}="${value}"/>`)), new RegExp(field));
+  }
   const bulk = w.parseSmsXml(xml(record.repeat(2000), ' count="2000"'));
   assert.equal(bulk.length, 2000);
   assert.equal(w.parseSmsXml(xml(record.replace('Maya', '😀'.repeat(100)))).length, 1);
@@ -33,8 +52,14 @@ async function main() {
     draftOperation = async (action, value) => { if (failForTest) throw new Error('storage full'); writesForTest.push(value); };
     saveDraft = () => {};`);
   const upload = (text, name = 'test.xml', size = 100) => w.importXmlFile({ name, size, text: async () => text });
-  await upload(xml(record));
+  await upload(xml(enrichedRecord));
   assert.equal(evaluate('messages.length'), 1);
+  assert.equal(evaluate('messages[0].read'), 0);
+  assert.equal(evaluate('writesForTest[0][0].locked'), 1);
+  assert.equal(evaluate('writesForTest[0][0].subject'), 'A&B');
+  assert.match(w.document.querySelector('[data-field="read"]').textContent, /未读（0）/);
+  assert.match(w.document.querySelector('[data-field="status"]').textContent, /失败（64）/);
+  assert.match(w.document.querySelector('[data-field="locked"]').textContent, /已锁定（1）/);
   assert.equal(w.document.querySelector('#messages input').value, 'Maya');
   await upload(xml(record.repeat(2000)));
   assert.equal(evaluate('messages.length'), 2001);

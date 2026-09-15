@@ -14,6 +14,8 @@ import java.net.HttpURLConnection;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -191,7 +193,7 @@ public final class LanClient {
 
     private Job parseJob(String id, JSONObject raw) throws Exception {
         if (!raw.has("batchSize") || !raw.has("batchCount") || !raw.has("preview")) {
-            throw new IOException("电脑端协议不兼容，请升级电脑端和手机 App 至 1.1.0 或更新版本");
+            throw new IOException("电脑端协议不兼容，请升级电脑端和手机 App 至 1.2.0 或更新版本");
         }
         int count = integer(raw, "count");
         if (count < 1 || count > 100000 || integer(raw, "batchSize") != BatchImporter.BATCH_SIZE
@@ -215,11 +217,14 @@ public final class LanClient {
         List<SmsRecord> records = new ArrayList<>();
         for (int i = 0; i < array.length(); i++) {
             JSONObject item = array.getJSONObject(i);
-            Object sender = item.get("sender"), body = item.get("body"), timestamp = item.get("timestamp");
-            if (!(sender instanceof String) || !(body instanceof String)
-                    || !(timestamp instanceof Long || timestamp instanceof Integer)) throw new IOException("短信字段类型无效");
-            SmsRecord record = new SmsRecord((String) sender, (String) body, ((Number) timestamp).longValue());
-            BatchImporter.validate(record);
+            Map<String, Object> fields = new HashMap<>();
+            Iterator<String> names = item.keys();
+            while (names.hasNext()) {
+                String name = names.next();
+                Object value = item.get(name);
+                fields.put(name, value == JSONObject.NULL ? null : value);
+            }
+            SmsRecord record = SmsRecord.fromFields(fields);
             records.add(record);
         }
         return records;
@@ -324,7 +329,7 @@ public final class LanClient {
         connection.setConnectTimeout(5000);
         connection.setReadTimeout(10000);
         connection.setRequestProperty("Accept", "application/json");
-        connection.setRequestProperty("X-SMS-Protocol", "2");
+        connection.setRequestProperty("X-SMS-Protocol", "3");
         if (!bearer.isEmpty()) connection.setRequestProperty("Authorization", "Bearer " + bearer);
         try {
             if (data != null) {
