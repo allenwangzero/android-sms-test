@@ -112,6 +112,21 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(self.call(device_path, token=first["deviceToken"])[1], {"request": None})
         self.assertNotIn("sms_requests", self.call("/api/state", token=self.admin)[1])
 
+    def test_apk_download_qr(self):
+        import qrcode
+        self.assertEqual(self.call("/api/apk")[0], 401)
+        self.assertEqual(self.call("/api/apk/qr")[0], 401)
+        status, download = self.call("/api/apk", token=self.admin)
+        self.assertEqual(status, 200)
+        self.assertEqual(download["version"], "v1.3.0")
+        self.assertEqual(download["url"], "https://github.com/allenwangzero/android-sms-test/releases/download/v1.3.0/android-sms-test-v1.3.0.apk")
+        with patch("qrcode.make", wraps=qrcode.make) as make:
+            status, svg = self.call("/api/apk/qr", token=self.admin)
+            self.assertEqual(status, 200)
+            self.assertIn(b"<svg", svg)
+            self.assertEqual(make.call_args.args[0], download["url"])
+        self.assertNotIn(self.admin.encode(), svg)
+
     def test_pair_qr_retry_rotation_expiration(self):
         token = self.pairing()
         self.assertNotEqual(token, self.admin)

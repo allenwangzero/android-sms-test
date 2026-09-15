@@ -345,6 +345,30 @@ function updateExpiry() {
   $('copy-pairing').disabled = !seconds || !pairingUrl;
 }
 
+async function refreshApkDownload() {
+  try {
+    const download = await (await api('/api/apk')).json();
+    $('apk-version').textContent = download.version;
+    $('apk-link').href = download.url;
+    $('apk-link').hidden = false;
+    const qr = await (await api('/api/apk/qr')).blob();
+    const objectUrl = URL.createObjectURL(qr);
+    const image = $('apk-qr');
+    image.onload = () => URL.revokeObjectURL(objectUrl);
+    image.onerror = () => {
+      URL.revokeObjectURL(objectUrl);
+      image.hidden = true;
+      $('apk-placeholder').hidden = false;
+      $('apk-placeholder').textContent = '二维码加载失败，请使用下方下载链接。';
+    };
+    image.src = objectUrl;
+    image.hidden = false;
+    $('apk-placeholder').hidden = true;
+  } catch (error) {
+    $('apk-placeholder').textContent = `下载二维码获取失败：${error.message}。请刷新页面重试。`;
+  }
+}
+
 async function refreshPairing(rotate = false) {
   $('rotate').disabled = true;
   $('copy-pairing').disabled = true;
@@ -653,7 +677,7 @@ async function initialize() {
     notify(`本地批次记录不可用，已禁用发送：${error.message}。请检查浏览器存储权限后刷新。`);
   }
   updateSend();
-  await Promise.all([refreshState(), refreshPairing()]);
+  await Promise.all([refreshState(), refreshPairing(), refreshApkDownload()]);
   setInterval(updateExpiry, 1000);
   async function poll() { await refreshState(); setTimeout(poll, 2000); }
   setTimeout(poll, 2000);

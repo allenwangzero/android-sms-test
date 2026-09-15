@@ -20,6 +20,11 @@ try:
 except ImportError:  # 直接运行 desktop/server.py
     from sms_management import ManagementError, SmsManagement
 
+# 固定与当前管理端兼容的公开发行包，升级协议时同步更新。
+APK_VERSION = "v1.3.0"
+APK_DOWNLOAD_URL = ("https://github.com/allenwangzero/android-sms-test/releases/download/"
+                    f"{APK_VERSION}/android-sms-test-{APK_VERSION}.apk")
+
 MAX_BODY = 16 * 1024 * 1024
 MAX_COUNT = 100000
 BATCH_SIZE = 500
@@ -422,6 +427,14 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, store.device_batch(self.token(), parts[4], int(parts[6])))
         if method == "GET" and path == "/api/state":
             return self.send(200, store.state())
+        if method == "GET" and path in {"/api/apk", "/api/apk/qr"}:
+            if path.endswith("/qr"):
+                import qrcode
+                import qrcode.image.svg
+                output = io.BytesIO()
+                qrcode.make(APK_DOWNLOAD_URL, image_factory=qrcode.image.svg.SvgPathImage).save(output)
+                return self.send(200, output.getvalue(), "image/svg+xml")
+            return self.send(200, {"version": APK_VERSION, "url": APK_DOWNLOAD_URL})
         if method == "GET" and path in {"/api/pairing", "/api/pairing/qr"}:
             pairing = store.pairing()
             if path.endswith("/qr"):
