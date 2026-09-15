@@ -26,6 +26,7 @@ jobs:
       - run: node scripts/test-pending-storage.cjs "$RUNNER_TEMP/sms-tests/node_modules/fake-indexeddb"
       - run: node scripts/test-xml-import.cjs "$RUNNER_TEMP/sms-tests/node_modules/jsdom"
       - run: node scripts/test-export-roundtrip.cjs "$RUNNER_TEMP/sms-tests/node_modules/jsdom"
+      - run: node scripts/test-devices.cjs "$RUNNER_TEMP/sms-tests/node_modules/jsdom"
       - run: node scripts/test-sms-manager.cjs "$RUNNER_TEMP/sms-tests/node_modules/jsdom" "$RUNNER_TEMP/sms-tests/node_modules/fake-indexeddb"
   docker:
     runs-on: ubuntu-latest

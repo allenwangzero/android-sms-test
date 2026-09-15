@@ -36,6 +36,7 @@ v6（v1.5.0）需要电脑服务、网页和 APK 同步升级。旧的 POST /api
 Authorization: Bearer ADMIN_TOKEN。管理链接 `http://127.0.0.1:8765/#token=ADMIN_TOKEN`，页面存入 sessionStorage 后清除 fragment。管理 token 不能出现在 QR。
 
 - GET /api/apk → `{version:"v1.5.0",url:"http://电脑局域网地址:端口/downloads/android-sms-test-v1.5.0.apk"}`；GET /api/apk/qr 返回对应 SVG，均需管理员认证。下载本身 GET `/downloads/android-sms-test-v1.5.0.apk` 无需令牌，仅暴露 `dist` 中此固定文件；缺包返回 404，不提供目录浏览。
+- POST `/api/devices/ID/remove`，管理员 Bearer，body `{}` → `{ok:true}`。ID 须有效 UUID；重复移除幂等成功，旧设备令牌失效。单个事务中取消包含此设备的未提交整次上传并保存取消 tombstone，结束此设备非终态导入/管理任务，保留已确认进度和历史结果，最后删除设备配对记录。已提交共享快照和其他设备任务不改动。重新配对创建新 ID/token，不恢复旧任务或旧设备批次关联。该 API 不调用手机 Provider，也不保证本地正在执行的操作立即停止。
 - GET /api/state → `{devices:[{id,name,lastSeen}], jobs:[任务元信息]}`。
 - GET /api/pairing → `{url:"sms-test://pair?url=http%3A%2F%2F192.168.1.2%3A8765&token=TOKEN", expiresAt:毫秒, serverUrl:"http://192.168.1.2:8765"}`。
 - GET /api/pairing/qr → SVG 二维码（前端 fetch Bearer 后以 blob 显示）。

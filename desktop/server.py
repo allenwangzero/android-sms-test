@@ -144,6 +144,31 @@ class Store(SmsManagement):
                             (device_id, client_id, device_token, name, now()))
             return {"deviceId": device_id, "deviceToken": device_token, "name": name}
 
+    def remove_device(self, device_id):
+        require(is_uuid(device_id), "设备 ID 无效")
+        with self.lock, self.db:
+            if not self.db.execute("SELECT 1 FROM devices WHERE id=?", (device_id,)).fetchone():
+                return {"ok": True}
+            # Cancel the complete immutable upload, rather than silently changing its target set.
+            for upload in self.db.execute("SELECT id,device_ids FROM uploads WHERE job_ids='[]'").fetchall():
+                if device_id not in json.loads(upload["device_ids"]):
+                    continue
+                upload_id = upload["id"]
+                self.db.execute("DELETE FROM upload_batches WHERE upload_id=?", (upload_id,))
+                self.db.execute("DELETE FROM uploads WHERE id=?", (upload_id,))
+                self.db.execute("INSERT OR IGNORE INTO cancelled_uploads VALUES (?)", (upload_id,))
+            error = "设备配对已从管理端移除；任务结束，进度为最后已确认数量，手机已发生的操作不会回滚"
+            self.db.execute("UPDATE jobs SET status='interrupted',error=?,updated_at=? "
+                            "WHERE device_id=? AND status IN ('queued','received','writing')",
+                            (error, now(), device_id))
+            self.db.execute("UPDATE sms_requests SET status=CASE WHEN action IN ('list','batches') "
+                            "THEN 'failed' ELSE 'interrupted' END,count=COALESCE(count,0),error=? "
+                            "WHERE device_id=? AND status IN ('queued','ready','running')",
+                            (error, device_id))
+            # Remove credentials last, in the same transaction. Re-pairing creates a new identity.
+            self.db.execute("DELETE FROM devices WHERE id=?", (device_id,))
+            return {"ok": True}
+
     def admin(self, token):
         require(bool(token) and token.isascii() and hmac.compare_digest(token, self.admin_token), "管理认证失败", 401)
 
@@ -467,6 +492,9 @@ class Handler(BaseHTTPRequestHandler):
             if len(parts) == 9 and parts[1:5] == ["api", "device", "sms", "requests"] and parts[6:8] == ["export", "batches"]:
                 require(parts[8].isdigit() and len(parts[8]) <= 6, "导出分块索引无效")
                 return self.send(200, store.store_export_batch(self.token(), parts[5], int(parts[8]), data))
+            if len(parts) == 5 and parts[1:3] == ["api", "devices"] and parts[4] == "remove":
+                require(data == {}, "移除设备请求须为空对象")
+                return self.send(200, store.remove_device(parts[3]))
             if path == "/api/pairing/rotate":
                 return self.send(200, store.pairing(True))
             if path == "/api/pair":

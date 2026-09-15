@@ -3,11 +3,11 @@
   'use strict';
   const terminal = new Set(['completed', 'failed', 'interrupted', 'cancelled']);
   const labels = { queued: '等待手机处理', ready: '等待手机确认删除', running: '手机正在处理', completed: '已完成', failed: '失败，已停止', interrupted: '已中断，停止处理', cancelled: '手机已取消' };
-  window.initSmsManager = function ({ api, uuid, scope }) {
+  window.initSmsManager = function ({ api, uuid, scope, onRemoveDevice }) {
     const root = document.getElementById('sms-manager');
     root.innerHTML = `<div class="section-title"><h2>手机短信读取与删除</h2><span class="muted">读取、筛选与删除</span></div>
       <p>选择一台手机，点击读取。手机工具需保持前台并授予读取权限；完整列表和清空全部需先临时设为默认短信应用，否则系统可能仅返回收件和已发送短信。删除前会在手机再次确认。</p>
-      <label>目标手机<select id="sm-device"><option value="">请选择手机</option></select></label>
+      <div class="sm-device-controls"><label>目标手机<select id="sm-device"><option value="">请选择手机</option></select></label><button id="sm-remove-device" class="text-button danger" type="button">移除此设备</button></div><p id="sm-device-status" class="muted" role="status">请选择目标手机</p>
       <section class="sm-batches" aria-labelledby="sm-batches-heading">
         <div class="section-title"><h3 id="sm-batches-heading">按导入批次清理</h3><button id="sm-batches-load" class="secondary">读取导入批次</button></div>
         <p>每次完整导入为一个批次。从手机读取导入记录，仅支持升级后有记录的批次。清理不受下方短信筛选影响；已不存在的短信跳过，内容或字段已改变的短信不删除。仍需在手机确认。</p>
@@ -40,6 +40,14 @@
     const el = id => document.getElementById(`sm-${id}`);
     let database, storageError = '', device = '', revision = 0, rows = [], total = null, page = 0, loadedKey = '', selected = new Map(), filtered = false, pending = null, busy = false, polling = false;
     let batches = [], batchTotal = null, batchPage = 0, exported = null, downloading = false, deviceRevision = 0;
+    let knownDevices = [], removalBlocked = false, removing = false;
+    const removedDevices = new Set();
+    function updateDeviceStatus() {
+      const item = knownDevices.find(item => item.id === device);
+      const seen = item && Number.isFinite(item.lastSeen);
+      el('device-status').textContent = item ? `${seen && Date.now() - item.lastSeen <= 10000 ? '在线' : '离线'} · 最后在线：${seen ? new Date(item.lastSeen).toLocaleString('zh-CN') : '未知'}` : '请选择目标手机';
+      el('remove-device').disabled = !device || !onRemoveDevice || removalBlocked || removing;
+    }
     const filterIds = ['sender', 'keyword', 'from', 'to', 'read', 'status-filter', 'locked'];
     function filters() {
       const numeric = id => el(id).value === '' ? null : Number(el(id).value);
@@ -72,7 +80,8 @@
       });
     }
     function update() {
-      const available = !!device && !!database && !busy && !pending;
+      updateDeviceStatus();
+      const available = !!device && !!database && !busy && !pending && !removing && !removalBlocked;
       const loaded = total !== null && rows.length > 0;
       el('load').disabled = !available;
       el('batches-load').disabled = !available;
@@ -81,7 +90,7 @@
       el('batches-info').textContent = batchTotal === null ? '尚未读取导入批次 / 数据已失效，请重新读取' : `共 ${batchTotal} 批 · 第 ${batchPage + 1} / ${Math.max(1, Math.ceil(batchTotal / 50))} 页`;
       for (const button of el('batches-rows').querySelectorAll('button')) button.disabled = !available || button.dataset.recorded === '0';
       el('retry').hidden = !pending;
-      el('retry').disabled = busy || polling;
+      el('retry').disabled = busy || polling || removing || removalBlocked;
       el('prev').disabled = !available || total === null || page === 0;
       el('next').disabled = !available || total === null || (page + 1) * 50 >= total;
       el('page-select').disabled = !available || !loaded;
@@ -163,6 +172,7 @@
       el('meter').max = request.count || 1; el('meter').value = request.processed || 0;
     }
     async function accept(request, record, rev, target) {
+      if (removedDevices.has(target)) return;
       if (request.id !== record.payload.requestId || request.deviceId !== target || request.action !== record.payload.action) throw new Error('服务器返回的管理请求不匹配，已停止更新。');
       if (target === device) progress(request);
       if (!terminal.has(request.status)) return;
@@ -192,6 +202,7 @@
       render();
     }
     async function transmit(record, rev, target) {
+      if (removedDevices.has(target)) return;
       try {
         const response = await (await api('/api/sms/requests', { method: 'POST', body: JSON.stringify(record.payload) })).json();
         await accept(response, record, rev, target);
@@ -212,7 +223,7 @@
       }
     }
     async function start(action, selection, requestedPage = 0) {
-      if (busy || pending || !device) return;
+      if (busy || pending || !device || removing || removalBlocked) return;
       busy = true; update(); const target = device, rev = revision;
       try {
         const all = action === 'batches' || (['delete', 'export'].includes(action) && ['all', 'batch'].includes(selection.mode));
@@ -243,11 +254,18 @@
       if (!target || !database) return;
       busy = true; update();
       try { const saved = await storage('read', null, target); const lastExport = await storage('read', null, target, '|export'); if (device === target) { pending = saved; exported = lastExport; } }
-      catch (error) { notice(error.message); }
+      catch (error) { if (device === target) notice(error.message); }
       finally { busy = false; update(); }
       await poll();
     }
     el('device').addEventListener('change', () => { device = el('device').value; deviceRevision++; exported = null; invalidate(); invalidateBatches(); el('progress').textContent = ''; el('meter').hidden = true; notice(''); restore(); });
+    el('remove-device').addEventListener('click', async () => {
+      if (!device || !onRemoveDevice || removalBlocked || removing) return;
+      const target = device; removing = true; update();
+      try { await onRemoveDevice(target); }
+      catch (error) { if (target === device) notice(`移除失败：${error.message}`); }
+      finally { removing = false; update(); }
+    });
     for (const id of filterIds) el(id).addEventListener('input', invalidate);
     el('batches-load').addEventListener('click', () => start('batches', null, 0));
     el('batches-prev').addEventListener('click', () => start('batches', null, batchPage - 1));
@@ -315,12 +333,17 @@
     update();
     return {
       ready,
+      setRemovalBlocked(value) { removalBlocked = value; update(); },
       setDevices(devices) {
         const old = device;
+        for (const item of knownDevices) if (!devices.some(next => next.id === item.id)) removedDevices.add(item.id);
+        knownDevices = devices.filter(item => !removedDevices.has(item.id));
+        devices = knownDevices;
         el('device').replaceChildren(new Option('请选择手机', ''));
-        for (const item of devices) el('device').append(new Option(item.name || item.id, item.id));
+        for (const item of devices) el('device').append(new Option(`${item.name || item.id} · ${Number.isFinite(item.lastSeen) && Date.now() - item.lastSeen <= 10000 ? '在线' : '离线'}`, item.id));
         if (devices.some(item => item.id === old)) el('device').value = old;
-        else if (old) { device = ''; deviceRevision++; exported = null; pending = null; invalidate(); invalidateBatches(); }
+        else if (old) { device = ''; deviceRevision++; exported = null; pending = null; invalidate(); invalidateBatches(); el('progress').textContent = ''; el('meter').hidden = true; notice(''); }
+        update();
       },
       dispose() { clearInterval(timer); if (database) database.close(); },
       poll,

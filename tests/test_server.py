@@ -86,6 +86,21 @@ class ServerTests(unittest.TestCase):
         return self.call(f"/api/device/jobs/{job['id']}/status",
                          {"status": status, "written": written, "error": error}, device["deviceToken"])
 
+    def test_remove_device_admin_auth_and_revocation(self):
+        first, second = self.device(), self.device()
+        path = "/api/devices/" + first["deviceId"] + "/remove"
+        self.assertEqual(self.call(path, {})[0], 401)
+        self.assertEqual(self.call(path, {}, first["deviceToken"])[0], 401)
+        self.assertEqual(self.call(path, {"id": second["deviceId"]}, self.admin)[0], 400)
+        self.assertEqual(self.call(path, {}, self.admin, {"Origin": "http://malicious.invalid"})[0], 403)
+        self.assertEqual(self.call("/api/devices/invalid/remove", {}, self.admin)[0], 400)
+        self.assertEqual(self.call(path, {}, self.admin), (200, {"ok": True}))
+        self.assertEqual(self.call(path, {}, self.admin), (200, {"ok": True}))
+        self.assertEqual(self.call("/api/device/jobs", token=first["deviceToken"])[0], 401)
+        self.assertEqual(self.call("/api/device/sms/requests", token=first["deviceToken"])[0], 401)
+        self.assertEqual(self.call("/api/device/jobs", token=second["deviceToken"])[0], 200)
+        self.assertEqual([d["id"] for d in self.call("/api/state", token=self.admin)[1]["devices"]], [second["deviceId"]])
+
     def test_management_http_auth_and_protocol(self):
         first, second = self.device(), self.device()
         request = {"requestId": str(uuid.uuid4()), "deviceId": first["deviceId"], "action": "list"}

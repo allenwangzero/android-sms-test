@@ -41,7 +41,7 @@ async function harness(options = {}) {
     return response(request);
   };
   window.eval(source);
-  const manager = window.initSmsManager({ api, uuid: () => `request-${++sequence}`, scope: options.scope || 'origin|token' });
+  const manager = window.initSmsManager({ api, uuid: () => `request-${++sequence}`, scope: options.scope || 'origin|token', onRemoveDevice: options.onRemoveDevice });
   await manager.ready;
   manager.setDevices([{ id: 'phone-1', name: 'Test phone' }, { id: 'phone-2', name: 'Second phone' }]);
   const el = id => window.document.getElementById(`sm-${id}`);
@@ -54,6 +54,46 @@ async function harness(options = {}) {
 (async () => {
   let tests = 0;
   async function test(name, run) { await run(); console.log(`PASS ${name}`); tests++; }
+  await test('device heartbeat labels update without losing selection, rows or active requests; names are plain text', async () => {
+    const h = await harness(); try {
+      const now = 1800000000000; h.window.Date.now = () => now;
+      const devices = [{ id: 'phone-1', name: '<img src=x onerror=alert(1)>', lastSeen: now - 10000 }, { id: 'phone-2', name: 'Second phone' }];
+      h.manager.setDevices(devices); await h.select(); await h.load(); h.el('rows').querySelector('input').click();
+      assert.match(h.el('device').selectedOptions[0].textContent, / · 在线$/);
+      assert.match(h.el('device-status').textContent, /最后在线：/);
+      h.window.Date.now = () => now + 1; h.manager.setDevices(devices);
+      assert.equal(h.el('device').value, 'phone-1'); assert.match(h.el('device').selectedOptions[0].textContent, / · 离线$/);
+      assert.equal(h.el('device').querySelector('img'), null); assert.equal(h.el('rows').children.length, 50); assert.match(h.el('selection').textContent, /1 条/);
+      h.el('delete').click(); await until(() => h.posts().length === 2 && !h.el('retry').disabled);
+      h.manager.setDevices(devices); assert.equal(h.el('retry').hidden, false); assert.match(h.el('progress').textContent, /等待手机确认/);
+      await h.select('phone-2'); assert.match(h.el('device-status').textContent, /离线 · 最后在线：未知/);
+    } finally { h.close(); }
+  });
+  await test('manager removal uses shared callback, blocks duplicates, and retains device on cancel or failure', async () => {
+    let release, count = 0;
+    const h = await harness({ onRemoveDevice: async id => { assert.equal(id, 'phone-1'); count++; return new Promise(resolve => { release = resolve; }); } });
+    try {
+      await h.select(); h.manager.setRemovalBlocked(true); assert.equal(h.el('remove-device').disabled, true);
+      h.manager.setRemovalBlocked(false); h.el('remove-device').click(); h.el('remove-device').click();
+      assert.equal(count, 1); assert.equal(h.el('load').disabled, true); release(false); await sleep();
+      assert.equal(h.el('device').value, 'phone-1'); assert.equal(h.el('remove-device').disabled, false);
+    } finally { h.close(); }
+    const failed = await harness({ onRemoveDevice: async () => { throw new Error('network error'); } });
+    try { await failed.select(); failed.el('remove-device').click(); await sleep(); assert.equal(failed.el('device').value, 'phone-1'); assert.match(failed.el('notice').textContent, /移除失败/); } finally { failed.close(); }
+  });
+  await test('removed device clears private results and rejects late response and stale device lists', async () => {
+    let release;
+    const h = await harness({ postHook: payload => new Promise(resolve => { release = () => resolve(response({ id: payload.requestId, deviceId: payload.deviceId, action: 'list', status: 'completed', count: 1, result: { total: 1, page: 0, pageSize: 50, rows: [row(1)] } })); }) });
+    try {
+      await h.select(); h.el('load').click(); await until(() => release);
+      h.el('progress').textContent = 'old operation'; h.el('meter').hidden = false;
+      h.manager.setDevices([{ id: 'phone-2', name: 'Second phone' }]);
+      assert.equal(h.el('device').value, ''); assert.equal(h.el('progress').textContent, ''); assert.equal(h.el('meter').hidden, true); assert.equal(h.el('notice').hidden, true);
+      release(); await sleep(); await sleep(); assert.equal(h.el('rows').children.length, 0); assert.equal(h.el('progress').textContent, '');
+      h.manager.setDevices([{ id: 'phone-1', name: 'stale' }, { id: 'phone-2', name: 'Second phone' }]);
+      assert.equal(h.el('device').querySelector('option[value="phone-1"]'), null);
+    } finally { h.close(); }
+  });
   await test('only user click reads SMS; default excludes locked; text renders safely', async () => {
     const h = await harness(); try { await h.select(); assert.equal(h.calls.length, 0); await h.load(); assert.equal(h.posts()[0].filters.locked, 0); assert.equal(h.el('rows').children.length, 50); assert.equal(h.el('rows').querySelector('img,script'), null); assert.match(h.el('rows').textContent, /<script>/); } finally { h.close(); }
   });

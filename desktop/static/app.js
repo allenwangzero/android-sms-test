@@ -16,6 +16,9 @@ let page = 0;
 let connected = false;
 let sending = false;
 let preparing = false;
+let removingDevice = false;
+let stateRevision = 0;
+const removedDevices = new Set();
 let generating = false;
 let importing = false;
 let draftRevision = 0;
@@ -254,23 +257,26 @@ function renderMessages() {
   updateCounts();
 }
 
-function online(device) { return Date.now() - device.lastSeen <= 10000; }
+function online(device) { return Number.isFinite(device.lastSeen) && Date.now() - device.lastSeen <= 10000; }
 
 function updateSend() {
+  for (const button of document.querySelectorAll('[data-remove-device]')) button.disabled = removingDevice || sending || preparing;
+  window.smsManager?.setRemovalBlocked(removingDevice || sending || preparing);
   const available = devices.filter(device => selected.has(device.id) && online(device)).length;
   $('selection-summary').textContent = selected.size ? `已选 ${selected.size} 台手机 · ${available} 台在线` : '请选择目标手机';
-  $('send').disabled = !draftLoaded || sending || preparing || generating || importing || !connected || !pendingStorageReady || !messages.length || !selected.size || selected.size !== available || Boolean(retryPayload);
+  $('send').disabled = !draftLoaded || removingDevice || sending || preparing || generating || importing || !connected || !pendingStorageReady || !messages.length || !selected.size || selected.size !== available || Boolean(retryPayload);
   $('send').textContent = sending ? '正在分批传输…' : preparing ? '正在校验…' : '发送到手机';
   $('generate').disabled = !draftLoaded || generating || importing;
   $('generate').textContent = generating ? '正在生成…' : '随机生成并追加';
-  $('retry').disabled = sending || !connected || !pendingStorageReady;
-  $('cancel-upload').disabled = sending || !connected || !pendingStorageReady;
+  $('retry').disabled = removingDevice || sending || !connected || !pendingStorageReady;
+  $('cancel-upload').disabled = removingDevice || sending || !connected || !pendingStorageReady;
 }
 
 function renderDevices() {
   $('device-count').textContent = `${devices.length} 台`;
   const fragment = document.createDocumentFragment();
   devices.forEach(device => {
+    const row = element('div', 'device-row');
     const label = element('label', 'device');
     const checkbox = element('input');
     checkbox.type = 'checkbox';
@@ -284,7 +290,11 @@ function renderDevices() {
     text.append(element('div', 'device-name', device.name));
     text.append(element('div', 'device-detail', `设备 ${device.id.slice(0, 8)}`));
     label.append(checkbox, text, element('span', online(device) ? 'badge online' : 'badge', online(device) ? '在线' : '离线'));
-    fragment.append(label);
+    const remove = element('button', 'text-button danger', '移除');
+    remove.type = 'button'; remove.dataset.removeDevice = device.id;
+    remove.setAttribute('aria-label', `移除设备 ${device.name || device.id}`);
+    remove.addEventListener('click', () => removeDevice(device.id));
+    row.append(label, remove); fragment.append(row);
   });
   if (!devices.length) fragment.append(element('p', 'empty', '还没有连接的手机，请先扫码配对。'));
   $('devices').replaceChildren(fragment);
@@ -318,9 +328,12 @@ function renderJobs() {
 }
 
 async function refreshState() {
+  const revision = ++stateRevision;
   try {
     const state = await (await api('/api/state')).json();
-    devices = state.devices;
+    if (revision !== stateRevision) return;
+    devices = state.devices.filter(device => !removedDevices.has(device.id));
+    selected = new Set([...selected].filter(id => devices.some(device => device.id === id)));
     if (window.smsManager) window.smsManager.setDevices(devices);
     jobs = state.jobs;
     connected = true;
@@ -329,12 +342,46 @@ async function refreshState() {
     renderDevices();
     renderJobs();
   } catch (error) {
+    if (revision !== stateRevision) return;
     connected = false;
+    window.smsManager?.setDevices(devices);
     $('connection').textContent = error.httpStatus === 401 ? '管理链接无效' : '服务连接中断';
     $('connection').className = 'badge error';
     if (error.httpStatus === 401) notify('请使用启动服务时输出的完整管理链接打开页面（包含 #token=…）。');
     renderDevices();
   }
+}
+
+async function removeDevice(id) {
+  if (removingDevice || sending || preparing || !devices.some(device => device.id === id)) return false;
+  const device = devices.find(item => item.id === id);
+  if (!window.confirm(`移除设备“${device.name || id}”？
+仅移除电脑配对，不删除手机短信。未完成任务会结束，未提交且包含此设备的整次上传会取消。正在运行的手机操作可能到下一次连接时才停止。
+重新使用需扫码配对，视为新设备，旧批次记录不再关联。`)) return false;
+  removingDevice = true; updateSend();
+  try {
+    const result = await (await api(`/api/devices/${encodeURIComponent(id)}/remove`, { method: 'POST', body: '{}' })).json();
+    if (result.ok !== true) throw new Error('服务器未确认移除结果');
+    removedDevices.add(id); stateRevision++;
+    devices = devices.filter(item => item.id !== id); selected.delete(id);
+    window.smsManager?.setDevices(devices); renderDevices();
+    let storageWarning = '';
+    try {
+      const saved = pendingStorageReady ? await pendingOperation('read') : retryPayload;
+      if (saved?.deviceIds.includes(id)) {
+        const remaining = await pendingOperation('clear', saved);
+        if (remaining) showPending(remaining, '另一页面已有待确认批次。');
+        else { retryPayload = null; $('retry-box').hidden = true; }
+        $('upload-status').textContent = '包含已移除设备的待确认上传记录已清除，请核对任务历史。';
+      }
+    } catch (error) { storageWarning = ` 本地上传记录清理失败：${error.message}。`; }
+    await refreshState();
+    notify(`设备已移除，手机短信未删除。${storageWarning}`);
+    return true;
+  } catch (error) {
+    notify(`未确认设备移除：${error.message}。请刷新列表核对，不会自动重试移除。`);
+    return false;
+  } finally { removingDevice = false; updateSend(); }
 }
 
 function updateExpiry() {
@@ -450,7 +497,7 @@ async function uploadPayload(payload, onStarted) {
 }
 
 async function submitPayload(payload) {
-  if (!pendingStorageReady || sending) return;
+  if (!pendingStorageReady || removingDevice || sending) return;
   sending = true;
   notify('');
   updateSend();
@@ -493,7 +540,7 @@ async function submitPayload(payload) {
 }
 
 async function cancelPendingUpload() {
-  if (!retryPayload || sending || !pendingStorageReady) return;
+  if (!retryPayload || removingDevice || sending || !pendingStorageReady) return;
   const payload = retryPayload;
   sending = true; updateSend();
   try {
@@ -615,7 +662,7 @@ $('cancel-upload').addEventListener('click', () => {
 });
 $('retry').addEventListener('click', () => { if (retryPayload && !sending) submitPayload(retryPayload); });
 $('send').addEventListener('click', async () => {
-  if (sending || preparing || generating || importing || retryPayload) return;
+  if (removingDevice || sending || preparing || generating || importing || retryPayload) return;
   preparing = true; updateSend();
   try {
     if (!selected.size) throw new Error('请先选择目标手机。');
@@ -662,7 +709,7 @@ async function initialize() {
     if (incomingToken) sessionStorage.setItem(TOKEN_KEY, incomingToken);
   } catch { token = incomingToken || ''; }
   if (incomingToken) history.replaceState(null, '', location.pathname + location.search);
-  if (window.initSmsManager) window.smsManager = window.initSmsManager({ api, uuid, scope: `${location.origin}|${token}` });
+  if (window.initSmsManager) window.smsManager = window.initSmsManager({ api, uuid, onRemoveDevice: removeDevice, scope: `${location.origin}|${token}` });
   else if ($('sms-manager')) $('sms-manager').textContent = '手机短信管理模块未能加载，请刷新页面后重试。';
   renderMessages();
   if (!token) notify('请使用启动服务时输出的完整管理链接打开页面（包含 #token=…）。');
