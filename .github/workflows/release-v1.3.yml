@@ -1,0 +1,68 @@
+name: Publish verified v1.3.0 APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [.github/workflows/release-v1.3.yml]
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: publish-v1.3.0
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      BUILD_RUN: '34925800205'
+      BUILD_SHA: 7c2e8940fb22aa5147d49560632abfe12c42eb8e
+      ARTIFACT_ID: '10379312737'
+    steps:
+      - name: Verify successful source build
+        run: |
+          gh api "repos/$GH_REPO/actions/runs/$BUILD_RUN" > run.json
+          jq -e --arg sha "$BUILD_SHA" '.conclusion == "success" and .head_sha == $sha and .head_branch == "main" and .path == ".github/workflows/build.yml"' run.json
+          gh api "repos/$GH_REPO/actions/artifacts/$ARTIFACT_ID" > artifact.json
+          jq -e --argjson run "$BUILD_RUN" '.name == "sms-lan-debug-apk" and .expired == false and .workflow_run.id == $run' artifact.json
+      - name: Download and verify APK
+        run: |
+          gh api "repos/$GH_REPO/actions/artifacts/$ARTIFACT_ID/zip" > artifact.zip
+          echo '9db3d39f0fcaa3f80e5f43dcb707d86e2dd566c744666412dc97e23923190170  artifact.zip' | sha256sum --check
+          unzip -p artifact.zip app-debug.apk > android-sms-test-v1.3.0.apk
+          test -s android-sms-test-v1.3.0.apk
+          sha256sum android-sms-test-v1.3.0.apk > SHA256SUMS.txt
+      - name: Publish release
+        run: |
+          if gh release view v1.3.0 --json isDraft > release.json 2>/dev/null; then
+            echo 'Release v1.3.0 already exists; leaving it unchanged.'
+            exit 0
+          fi
+          cat > notes.md <<'EOF'
+          安卓短信局域网测试工具：读取、勾选、筛选与确认删除。
+
+          下载 android-sms-test-v1.3.0.apk 安装到 Android 8.0 或更新版本的测试机。无需 root。
+
+          电脑一次生成完整列表，自动按每批 500 条传输，单任务最多 100,000 条。手机确认一次后依次导入，显示总进度；失败或退出前台后停止，不自动重试已写入短信。
+
+          请同时更新电脑端和 APK。电脑端支持 Docker：更新源码后执行 docker compose up -d --build。
+
+          新增手机短信管理：分页读取、跨页勾选、条件筛选、删除全部筛选结果、一键清空系统短信。手机预览固定目标并确认后，每批最多 200 条删除，显示总进度，失败停止。清空包含锁定短信及全部 SMS 类型，不包含 MMS；预览后新到短信不纳入该任务。
+
+          读取需授予短信权限；完整读取与清空全部需先临时设为默认短信应用。删除不可恢复，不自动续删；短信变化或消失会停止。电脑刷新后可恢复原请求，重试不会创建重复删除任务。
+
+          XML 的 protocol、type、subject、service_center、read、status、locked 会保留并写入标准短信字段，电脑与手机预览展示 read/status/locked 的中文含义和数值。仅支持 type=1 收件短信；toa/sc_toa 没有 Android 标准列，仅接受空值，非空明确拒绝。
+
+          本版使用协议 4，必须同步更新电脑端与 APK。已通过服务端、Docker、浏览器、Java 执行器与指纹测试，以及真实管理服务和模拟设备的浏览器联调，尚未完成各型号真机验收。旧版若提示签名冲突，需结束当前任务后卸载旧工具再安装。
+
+          这是测试用 debug APK。写入前需临时设为默认短信应用，完成后恢复原应用；不模拟运营商来信广播。真机兼容性仍需按 README 验收。
+
+          APK 来自通过编译、lint 和桌面端测试的构建：
+          https://github.com/allenwangzero/android-sms-test/actions/runs/34925800205
+          EOF
+          gh release create v1.3.0 android-sms-test-v1.3.0.apk SHA256SUMS.txt --target "$BUILD_SHA" --title '短信测试工具 v1.3.0' --notes-file notes.md
