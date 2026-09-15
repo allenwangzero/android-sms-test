@@ -8,7 +8,7 @@ from unittest.mock import patch
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from desktop.server import ApiError, BATCH_SIZE, MAX_BODY, Server, Store
+from desktop.server import ApiError, BATCH_SIZE, MAX_BODY, APK_FILENAME, APK_DOWNLOAD_PATH, Server, Store
 
 
 class ServerTests(unittest.TestCase):
@@ -114,18 +114,34 @@ class ServerTests(unittest.TestCase):
 
     def test_apk_download_qr(self):
         import qrcode
+        self.server.apk_dir = Path(self.temp.name) / "dist"
+        self.server.apk_dir.mkdir()
+        for path in ("/api/apk", "/api/apk/qr", APK_DOWNLOAD_PATH):
+            self.assertEqual(self.call(path, token=self.admin)[0], 404)
+        payload = b"PK\x03\x04test-apk"
+        (self.server.apk_dir / APK_FILENAME).write_bytes(payload)
         self.assertEqual(self.call("/api/apk")[0], 401)
         self.assertEqual(self.call("/api/apk/qr")[0], 401)
         status, download = self.call("/api/apk", token=self.admin)
         self.assertEqual(status, 200)
         self.assertEqual(download["version"], "v1.3.0")
-        self.assertEqual(download["url"], "https://github.com/allenwangzero/android-sms-test/releases/download/v1.3.0/android-sms-test-v1.3.0.apk")
+        self.assertEqual(download["url"], "http://192.168.1.2:8765/downloads/android-sms-test-v1.3.0.apk")
         with patch("qrcode.make", wraps=qrcode.make) as make:
             status, svg = self.call("/api/apk/qr", token=self.admin)
             self.assertEqual(status, 200)
             self.assertIn(b"<svg", svg)
             self.assertEqual(make.call_args.args[0], download["url"])
         self.assertNotIn(self.admin.encode(), svg)
+        self.assertEqual(self.call(APK_DOWNLOAD_PATH), (200, payload))
+        self.assertEqual(self.call("/downloads/../desktop/server.py")[0], 404)
+        self.assertEqual(self.call("/downloads/app-debug.apk")[0], 404)
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port)
+        connection.request("GET", APK_DOWNLOAD_PATH)
+        response = connection.getresponse()
+        self.assertEqual(response.getheader("Content-Type"), "application/vnd.android.package-archive")
+        self.assertEqual(response.getheader("Content-Disposition"), f'attachment; filename="{APK_FILENAME}"')
+        self.assertEqual(response.read(), payload)
+        connection.close()
 
     def test_pair_qr_retry_rotation_expiration(self):
         token = self.pairing()

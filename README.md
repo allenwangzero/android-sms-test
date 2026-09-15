@@ -38,7 +38,9 @@ docker compose up -d --build
 docker compose logs desktop
 ```
 
-复制日志中带 `#token=...` 的完整“电脑管理页面”链接到浏览器。手机与电脑连接同一局域网，在安卓工具中扫描网页上的二维码；不要扫描容器内部地址。
+复制日志中带 `#token=...` 的完整“电脑管理页面”链接到浏览器。手机与电脑连接同一局域网，在安卓工具中扫描网页上的“连接手机”二维码；不要扫描容器内部地址。
+
+管理页还提供“下载安装 APK”二维码。将 `android-sms-test-v1.3.0.apk` 放入项目根目录的 `dist/`，手机用相机或浏览器扫码即可从电脑直接下载，无需访问 GitHub。Compose 已将 `./dist` 只读挂载至 `/app/dist`；Python 启动同样读取项目的 `dist/`。安装包缺失时页面会提示，不会跳转外网；安装包不会随 Git 仓库下载，需自行放入。
 
 默认使用端口 `8765`。如端口被占用，在 `.env` 中修改 `SMS_PORT` 后重新执行启动命令；Compose 会同步修改监听、映射和二维码端口。电脑防火墙需允许手机访问该端口。电脑 IP 变化后更新 `.env` 并重新启动，手机重新扫码连接。
 
@@ -58,7 +60,7 @@ docker compose up -d --build          # 更新镜像并重新启动
 ```sh
 docker build -t android-sms-test-desktop .
 docker run -d --name sms-test-desktop --init --restart unless-stopped \
-  -p 8765:8765 -v sms-test-data:/app/.data \
+  -p 8765:8765 -v sms-test-data:/app/.data -v "$PWD/dist:/app/dist:ro" \
   android-sms-test-desktop --advertise-host 192.168.1.20
 docker logs sms-test-desktop
 ```

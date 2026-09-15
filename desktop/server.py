@@ -20,10 +20,10 @@ try:
 except ImportError:  # 直接运行 desktop/server.py
     from sms_management import ManagementError, SmsManagement
 
-# 固定与当前管理端兼容的公开发行包，升级协议时同步更新。
+# 固定与当前管理端兼容的本地安装包，升级协议时同步更新。
 APK_VERSION = "v1.3.0"
-APK_DOWNLOAD_URL = ("https://github.com/allenwangzero/android-sms-test/releases/download/"
-                    f"{APK_VERSION}/android-sms-test-{APK_VERSION}.apk")
+APK_FILENAME = f"android-sms-test-{APK_VERSION}.apk"
+APK_DOWNLOAD_PATH = f"/downloads/{APK_FILENAME}"
 
 MAX_BODY = 16 * 1024 * 1024
 MAX_COUNT = 100000
@@ -347,6 +347,7 @@ class Server(ThreadingHTTPServer):
         super().__init__(address, Handler)
         self.store = store
         self.static_dir = static_dir or Path(__file__).parent / "static"
+        self.apk_dir = Path(__file__).resolve().parent.parent / "dist"
         advertised = urlsplit(store.server_url)
         port = self.server_address[1]
         hosts = {"127.0.0.1", "localhost", advertised.hostname}
@@ -368,12 +369,14 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, format_string, *args):
         pass  # 配对码、设备令牌和短信正文均不记录。
 
-    def send(self, status, payload, content_type="application/json; charset=utf-8"):
+    def send(self, status, payload, content_type="application/json; charset=utf-8", download_name=None):
         content = (json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
                    if isinstance(payload, dict) else payload)
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(content)))
+        if download_name:
+            self.send_header("Content-Disposition", f'attachment; filename="{download_name}"')
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
@@ -427,14 +430,21 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, store.device_batch(self.token(), parts[4], int(parts[6])))
         if method == "GET" and path == "/api/state":
             return self.send(200, store.state())
+        if method == "GET" and path == APK_DOWNLOAD_PATH:
+            apk = self.server.apk_dir / APK_FILENAME
+            require(apk.is_file(), f"安装包不存在，请将 {APK_FILENAME} 放入电脑端 dist 目录", 404)
+            return self.send(200, apk.read_bytes(), "application/vnd.android.package-archive", APK_FILENAME)
         if method == "GET" and path in {"/api/apk", "/api/apk/qr"}:
+            require((self.server.apk_dir / APK_FILENAME).is_file(),
+                    f"安装包不存在，请将 {APK_FILENAME} 放入电脑端 dist 目录", 404)
+            download_url = store.server_url.rstrip("/") + APK_DOWNLOAD_PATH
             if path.endswith("/qr"):
                 import qrcode
                 import qrcode.image.svg
                 output = io.BytesIO()
-                qrcode.make(APK_DOWNLOAD_URL, image_factory=qrcode.image.svg.SvgPathImage).save(output)
+                qrcode.make(download_url, image_factory=qrcode.image.svg.SvgPathImage).save(output)
                 return self.send(200, output.getvalue(), "image/svg+xml")
-            return self.send(200, {"version": APK_VERSION, "url": APK_DOWNLOAD_URL})
+            return self.send(200, {"version": APK_VERSION, "url": download_url})
         if method == "GET" and path in {"/api/pairing", "/api/pairing/qr"}:
             pairing = store.pairing()
             if path.endswith("/qr"):

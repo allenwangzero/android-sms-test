@@ -16,6 +16,7 @@ services:
       - "${SMS_ADVERTISE_HOST:?请在 .env 中填写电脑的局域网 IPv4 地址 SMS_ADVERTISE_HOST}"
     volumes:
       - sms-data:/app/.data
+      - ./dist:/app/dist:ro
 
 volumes:
   sms-data:
