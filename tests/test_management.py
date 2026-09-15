@@ -156,6 +156,7 @@ class ManagementTests(unittest.TestCase):
         reopened = Store(old, self.store.server_url)
         try:
             self.assertEqual(reopened.db.execute('SELECT COUNT(*) FROM sms_requests').fetchone()[0], 0)
+            self.assertEqual(reopened.db.execute('SELECT COUNT(*) FROM sms_export_batches').fetchone()[0], 0)
             self.assertIn('upload_id', {row['name'] for row in reopened.db.execute('PRAGMA table_info(jobs)')})
         finally:
             reopened.db.close()

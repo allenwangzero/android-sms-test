@@ -4,6 +4,14 @@ import re
 import time
 import uuid
 
+try:
+    from .sms_export import encode_document
+except ImportError:
+    from sms_export import encode_document
+
+EXPORT_BATCH_SIZE = 500
+EXPORT_MAX_BYTES = 256 * 1024 * 1024
+
 ACTIVE = {"queued", "ready", "running"}
 TERMINAL = {"completed", "failed", "interrupted", "cancelled"}
 DEFAULT_FILTERS = {"sender": "", "keyword": "", "dateFrom": None, "dateTo": None,
@@ -55,7 +63,7 @@ def validate_request(data):
                   {"requestId", "deviceId", "action"})
     for key in ("requestId", "deviceId"):
         canonical_uuid(data[key], key)
-    require(data["action"] in ("list", "batches", "delete"), "请求操作无效")
+    require(data["action"] in ("list", "batches", "delete", "export"), "请求操作无效")
     filters = data.get("filters", {})
     object_fields(filters, DEFAULT_FILTERS)
     filters = DEFAULT_FILTERS | filters
@@ -77,6 +85,7 @@ def validate_request(data):
     selection = data.get("selection")
     object_fields(selection, {"mode", "items", "jobId"}, {"mode"})
     require(selection["mode"] in ("selected", "filtered", "all", "batch"), "删除选择无效")
+    require(data["action"] != "export" or selection["mode"] != "batch", "导出不支持批次选择")
     if selection["mode"] == "batch":
         canonical_uuid(selection.get("jobId"), "jobId")
     else:
@@ -141,6 +150,10 @@ class SmsManagement:
                 processed INTEGER NOT NULL DEFAULT 0, deleted INTEGER NOT NULL DEFAULT 0,
                 result TEXT, error TEXT NOT NULL DEFAULT '', last_report TEXT);
             CREATE INDEX IF NOT EXISTS sms_requests_device ON sms_requests(device_id, status);
+            CREATE TABLE IF NOT EXISTS sms_export_batches (
+                request_id TEXT NOT NULL, batch_index INTEGER NOT NULL,
+                messages TEXT NOT NULL, count INTEGER NOT NULL, byte_size INTEGER NOT NULL,
+                PRIMARY KEY (request_id, batch_index));
         """)
 
     @staticmethod
@@ -205,6 +218,19 @@ class SmsManagement:
             if row["action"] in ("list", "batches"):
                 require(row["status"] == "queued" and target in {"completed", "failed"}, "读取状态流转无效", 409)
                 require(data["processed"] == data["deleted"] == 0, "读取请求不能删除短信")
+            elif row["action"] == "export":
+                transitions = {"queued": {"running", "failed", "interrupted"},
+                               "running": {"running", "completed", "failed", "interrupted"}}
+                require(target in transitions[row["status"]], "导出状态流转无效", 409)
+                require(data["count"] <= 100000 and data["deleted"] == 0, "导出计数无效")
+                received = self.db.execute(
+                    "SELECT COALESCE(SUM(count),0) FROM sms_export_batches WHERE request_id=?",
+                    (request_id,)).fetchone()[0]
+                require(data["processed"] <= received, "导出进度超过已接收数量", 409)
+                if row["status"] == "queued":
+                    require(data["processed"] == 0, "导出快照建立前不能有传输进度")
+                if target == "completed":
+                    require(data["processed"] == data["count"] == received, "导出尚未完整接收", 409)
             else:
                 transitions = {"queued": {"ready", "failed", "interrupted", "cancelled"},
                                "ready": {"running", "failed", "interrupted", "cancelled"},
@@ -230,6 +256,14 @@ class SmsManagement:
                     else:
                         validate_rows(result[entries_key], 50)
                     require(len(result[entries_key]) == min(50, max(0, result["total"] - result["page"] * 50)), "列表条数与分页不符")
+                elif row["action"] == "export":
+                    fields = {"count", "batchSize", "batchCount"}
+                    object_fields(result, fields, fields)
+                    require(type(result["count"]) is int and result["count"] == data["count"]
+                            and type(result["batchSize"]) is int and result["batchSize"] == EXPORT_BATCH_SIZE
+                            and type(result["batchCount"]) is int
+                            and result["batchCount"] == (data["count"] + EXPORT_BATCH_SIZE - 1) // EXPORT_BATCH_SIZE,
+                            "导出快照元数据无效")
                 else:
                     selection = json.loads(row["payload"])["selection"]
                     selection_mode = selection["mode"]
@@ -248,9 +282,60 @@ class SmsManagement:
                     require(len(result["preview"]) <= data["count"], "预览超过目标数量")
             if row["action"] in ("list", "batches") and target == "completed" or target == "ready":
                 require(result is not None, "必须包含预览结果")
-            if row["action"] == "delete" and row["result"] is not None and result is not None:
-                require(canonical(result) == row["result"], "已确认的删除预览不能改变", 409)
+            if row["action"] == "export" and target in {"running", "completed"}:
+                require(result is not None or row["result"] is not None, "必须包含导出快照元数据")
+            if row["action"] in ("delete", "export") and row["result"] is not None and result is not None:
+                require(canonical(result) == row["result"], "已冻结的请求结果不能改变", 409)
             stored_result = canonical(result) if result is not None else row["result"]
             self.db.execute("UPDATE sms_requests SET status=?,count=?,processed=?,deleted=?,error=?,result=?,last_report=? WHERE id=?",
                             (target, data["count"], data["processed"], data["deleted"], data["error"], stored_result, encoded, request_id))
             return self.get_management(request_id)
+
+    def store_export_batch(self, token, request_id, index, data):
+        object_fields(data, {"messages"}, {"messages"})
+        require(integer(index, 0, 199), "导出分批索引无效")
+        with self.lock, self.db:
+            device_id = self.device(token)
+            row = self.db.execute("SELECT * FROM sms_requests WHERE id=? AND device_id=?",
+                                  (request_id, device_id)).fetchone()
+            require(row is not None, "短信管理请求不存在", 404)
+            require(row["action"] == "export" and row["status"] == "running", "导出请求未运行", 409)
+            expected = min(EXPORT_BATCH_SIZE, row["count"] - index * EXPORT_BATCH_SIZE)
+            require(isinstance(data["messages"], list) and expected > 0
+                    and len(data["messages"]) == expected, "导出分批数量不符")
+            snapshot, size = self.validate_messages(data["messages"])
+            existing = self.db.execute(
+                "SELECT messages FROM sms_export_batches WHERE request_id=? AND batch_index=?",
+                (request_id, index)).fetchone()
+            if existing:
+                require(existing["messages"] == snapshot, "导出分批内容不能改变", 409)
+            else:
+                received = self.db.execute(
+                    "SELECT COUNT(*) AS batches, COALESCE(SUM(byte_size),0) AS bytes "
+                    "FROM sms_export_batches WHERE request_id=?", (request_id,)).fetchone()
+                require(index == received["batches"], "导出分批须按顺序传输", 409)
+                require(received["bytes"] + size <= EXPORT_MAX_BYTES, "导出快照超过 256 MiB 限制", 413)
+                self.db.execute("INSERT INTO sms_export_batches VALUES(?,?,?,?,?)",
+                                (request_id, index, snapshot, len(data["messages"]), size))
+            self.db.execute("UPDATE devices SET last_seen=? WHERE id=?", (int(time.time() * 1000), device_id))
+            return {"requestId": request_id, "index": index, "count": expected}
+
+    def export_document(self, request_id, format_name):
+        require(format_name in ("xml", "json"), "只支持 XML 或 JSON 导出")
+        with self.lock:
+            row = self.db.execute("SELECT * FROM sms_requests WHERE id=?", (request_id,)).fetchone()
+            require(row is not None, "短信管理请求不存在", 404)
+            require(row["action"] == "export" and row["status"] == "completed", "导出尚未完成", 409)
+            batches = self.db.execute(
+                "SELECT messages FROM sms_export_batches WHERE request_id=? ORDER BY batch_index",
+                (request_id,)).fetchall()
+            messages = [message for batch in batches for message in json.loads(batch["messages"])]
+            require(len(messages) == row["count"], "导出快照不完整", 409)
+        try:
+            document, mime = encode_document(messages, format_name)
+        except ValueError as error:
+            raise ManagementError(400, str(error)) from None
+        message = ("XML 文件超过 256 MiB 限制，请下载 JSON 格式" if format_name == "xml"
+                   else "JSON 文件超过 256 MiB 限制")
+        require(len(document) <= EXPORT_MAX_BYTES, message, 413)
+        return document, mime, "sms-export-" + request_id + "." + format_name

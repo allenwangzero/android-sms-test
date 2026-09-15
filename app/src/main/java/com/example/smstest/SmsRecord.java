@@ -7,8 +7,8 @@ import java.util.Map;
 /** A test SMS with the metadata supported by Android's SMS provider. */
 public final class SmsRecord {
     public final String sender, body, subject, serviceCenter;
-    public final long timestamp;
-    public final int type, read, status, locked;
+    public final long timestamp, dateSent;
+    public final int type, read, status, locked, seen;
     public final Integer protocol;
 
     public SmsRecord(String sender, String body, long timestamp) {
@@ -17,6 +17,13 @@ public final class SmsRecord {
 
     public SmsRecord(String sender, String body, long timestamp, int type, Integer protocol,
             String subject, String serviceCenter, int read, int status, int locked) {
+        this(sender, body, timestamp, type, protocol, subject, serviceCenter, read, status, locked, 0, read);
+    }
+
+    public SmsRecord(String sender, String body, long timestamp, int type, Integer protocol,
+            String subject, String serviceCenter, int read, int status, int locked, long dateSent, int seen) {
+        this.dateSent = dateSent;
+        this.seen = seen;
         this.sender = sender;
         this.body = body;
         this.timestamp = timestamp;
@@ -48,9 +55,19 @@ public final class SmsRecord {
                 integer(fields, "type", 1, 1, 1), protocol,
                 nullableString(fields, "subject", 4000), nullableString(fields, "service_center", 100),
                 integer(fields, "read", 1, 0, 1), integer(fields, "status", -1, -1, 255),
-                integer(fields, "locked", 0, 0, 1));
+                integer(fields, "locked", 0, 0, 1), timestamp(fields, "date_sent"),
+                integer(fields, "seen", integer(fields, "read", 1, 0, 1), 0, 1));
         BatchImporter.validate(record);
         return record;
+    }
+
+    private static long timestamp(Map<String, Object> fields, String name) throws IOException {
+        if (!fields.containsKey(name)) return 0;
+        Object value = fields.get(name);
+        if (!(value instanceof Integer || value instanceof Long)) throw new IOException(name + " 必须是整数");
+        long number = ((Number) value).longValue();
+        if (number < 0 || number > 4102444800000L) throw new IOException(name + " 超出允许范围");
+        return number;
     }
 
     private static int integer(Map<String, Object> fields, String name, int fallback, int min, int max)
@@ -84,7 +101,8 @@ public final class SmsRecord {
         values.put("subject", subject);
         values.put("service_center", serviceCenter);
         values.put("read", read);
-        values.put("seen", read);
+        values.put("seen", seen);
+        values.put("date_sent", dateSent);
         values.put("status", status);
         values.put("locked", locked);
         return values;

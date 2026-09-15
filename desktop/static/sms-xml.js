@@ -5,7 +5,7 @@ globalThis.normalizeSmsMetadata = function normalizeSmsMetadata(record, index = 
   if (!record || typeof record !== 'object' || Array.isArray(record)) fail('记录必须是短信对象。');
   const result = { ...record };
   if (Object.hasOwn(record, 'type') && record.type !== 1) fail('仅支持 type="1" 的收件短信。');
-  const integers = { type: [1, 1, 1], protocol: [0, 255, 0], read: [0, 1, 1], status: [-1, 255, -1], locked: [0, 1, 0] };
+  const integers = { type: [1, 1, 1], protocol: [0, 255, 0], read: [0, 1, 1], status: [-1, 255, -1], locked: [0, 1, 0], date_sent: [0, 4102444800000, 0] };
   for (const [field, [min, max, fallback]] of Object.entries(integers)) {
     const value = Object.hasOwn(record, field) ? record[field] : fallback;
     if (!(field === 'protocol' && value === null) && (!Number.isInteger(value) || value < min || value > max)) {
@@ -13,6 +13,9 @@ globalThis.normalizeSmsMetadata = function normalizeSmsMetadata(record, index = 
     }
     result[field] = value;
   }
+  const seen = Object.hasOwn(record, 'seen') ? record.seen : result.read;
+  if (!Number.isInteger(seen) || seen < 0 || seen > 1) fail('seen 必须是 0–1 范围内的整数。');
+  result.seen = seen;
   for (const [field, limit] of Object.entries({ subject: 4000, service_center: 100 })) {
     const value = Object.hasOwn(record, field) ? record[field] : null;
     if (value !== null && (typeof value !== 'string' || [...value].length > limit)) fail(`${field} 必须是 null 或最多 ${limit} 个字符的文本。`);
@@ -52,6 +55,13 @@ globalThis.parseSmsXml = function parseSmsXml(text) {
     if (node.nodeType === 7) throw new Error('XML 不允许包含处理指令。');
   }
 
+  const ownFormat = root.getAttribute('format') === 'sms-test-v1';
+  const isNull = (node, field) => {
+    const marker = node.getAttribute(`${field}_null`);
+    if (ownFormat && marker !== null && marker !== 'true') throw new Error(`${field}_null 仅支持 true。`);
+    if (ownFormat && marker === 'true' && node.hasAttribute(field) && node.getAttribute(field) !== '') throw new Error(`${field} 的空值标记与文本值冲突。`);
+    return ownFormat ? marker === 'true' : node.getAttribute(field) === 'null';
+  };
   const records = [];
   for (const node of root.childNodes) {
     if (node.nodeType === 8) continue;
@@ -80,17 +90,19 @@ globalThis.parseSmsXml = function parseSmsXml(text) {
       fail(index, 'date 必须是 0–4102444800000 范围内的十进制整数毫秒时间戳。');
     }
     const metadata = {};
-    for (const field of ['type', 'protocol', 'read', 'status', 'locked']) {
-      if (!node.hasAttribute(field)) continue;
+    for (const field of ['type', 'protocol', 'read', 'status', 'locked', 'date_sent', 'seen']) {
+      if (!node.hasAttribute(field) && !(field === 'protocol' && ownFormat && node.hasAttribute('protocol_null'))) continue;
       const value = node.getAttribute(field);
-      if (field === 'protocol' && value === 'null') metadata[field] = null;
+      if (field === 'protocol' && isNull(node, field)) metadata[field] = null;
       else {
         if (!/^-?\d+$/.test(value)) fail(index, `${field} 必须是十进制整数${field === 'protocol' ? '或 null' : ''}。`);
         metadata[field] = Number(value);
       }
     }
     for (const field of ['subject', 'service_center', 'toa', 'sc_toa']) {
-      if (node.hasAttribute(field)) metadata[field] = node.getAttribute(field) === 'null' ? null : node.getAttribute(field);
+      if (node.hasAttribute(field) || (ownFormat && node.hasAttribute(`${field}_null`))) {
+        metadata[field] = isNull(node, field) ? null : node.getAttribute(field);
+      }
     }
     records.push(normalizeSmsMetadata({ sender, body, timestamp, ...metadata }, index));
   }
@@ -103,4 +115,22 @@ globalThis.parseSmsXml = function parseSmsXml(text) {
     }
   }
   return records;
+};
+
+
+globalThis.parseSmsJson = function parseSmsJson(text) {
+  let records;
+  try { records = JSON.parse(text); } catch { throw new Error('JSON 格式损坏。'); }
+  if (!Array.isArray(records) || records.length < 1 || records.length > 100000) throw new Error('JSON 必须是包含 1–100000 条短信的数组。');
+  const fields = new Set(['sender', 'body', 'timestamp', 'type', 'protocol', 'subject', 'service_center', 'read', 'status', 'locked', 'toa', 'sc_toa', 'seen', 'date_sent']);
+  return records.map((record, index) => {
+    const normalized = normalizeSmsMetadata(record, index);
+    const fail = message => { throw new Error(`第 ${index + 1} 条短信：${message}`); };
+    if (Object.keys(record).some(field => !fields.has(field))) fail('JSON 包含不支持的字段。');
+    for (const [field, limit] of [['sender', 100], ['body', 4000]]) {
+      if (typeof record[field] !== 'string' || !/[^\s\u0085\u001c-\u001f]/u.test(record[field]) || [...record[field]].length > limit) fail(`${field} 需为 1–${limit} 个字符且不全为空白。`);
+    }
+    if (!Number.isSafeInteger(record.timestamp) || record.timestamp < 0 || record.timestamp > 4102444800000) fail('timestamp 超出有效毫秒时间戳范围。');
+    return normalized;
+  });
 };

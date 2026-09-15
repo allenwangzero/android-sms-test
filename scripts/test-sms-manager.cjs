@@ -15,7 +15,10 @@ async function harness(options = {}) {
   const { window } = dom;
   Object.defineProperty(window, 'indexedDB', { value: options.database || new IDBFactory() });
   window.confirm = () => options.confirm !== false;
-  const calls = [], requests = new Map();
+  const calls = [], requests = options.requests || new Map(), downloads = [];
+  window.URL.createObjectURL = blob => { downloads.push({ blob }); return 'blob:export'; };
+  window.URL.revokeObjectURL = () => {};
+  window.HTMLAnchorElement.prototype.click = function () { downloads[downloads.length - 1].filename = this.download; };
   let postHook = options.postHook;
   const api = async (path, init = {}) => {
     calls.push({ path, init });
@@ -32,6 +35,7 @@ async function harness(options = {}) {
       const request = { id: payload.requestId, deviceId: payload.deviceId, action: payload.action, status: payload.action === 'list' ? 'completed' : 'ready', count: payload.action === 'list' ? 51 : 51, processed: 0, deleted: 0, error: '', result: payload.action === 'list' ? { total: 51, page: payload.page, pageSize: 50, rows: payload.page === 0 ? Array.from({ length: 50 }, (_, index) => row(index + 1)) : [row(51)] } : { count: 51, preview: [row(1)], selectionMode: payload.selection.mode } };
       requests.set(payload.requestId, request); return response(request);
     }
+    if (path.includes('/export?')) { if (options.downloadHook) return options.downloadHook(path); return { blob: async () => new window.Blob(['full-body-from-server']) }; }
     const request = requests.get(path.split('/').pop());
     if (!request) throw error(404);
     return response(request);
@@ -45,7 +49,7 @@ async function harness(options = {}) {
   function input(id, value) { el(id).value = value; el(id).dispatchEvent(new window.Event('input')); }
   async function load() { el('load').click(); await until(() => !el('load').disabled); }
   function posts() { return calls.filter(call => call.init.method === 'POST').map(call => JSON.parse(call.init.body)); }
-  return { window, manager, el, select, input, load, posts, requests, calls, setPostHook(value) { postHook = value; }, close() { manager.dispose(); } };
+  return { window, manager, el, select, input, load, posts, requests, calls, downloads, setPostHook(value) { postHook = value; }, close() { manager.dispose(); } };
 }
 (async () => {
   let tests = 0;
@@ -187,6 +191,79 @@ async function harness(options = {}) {
       await second.select(); assert.equal(second.el('retry').hidden, false); assert.equal(second.posts().length, 0);
       second.el('retry').click(); await until(() => second.posts().length === 1); assert.deepEqual(second.posts()[0], original);
     } finally { second.close(); }
+  });
+  function exportStatus(payload, status = 'queued', count = 501) {
+    return { id: payload.requestId, deviceId: payload.deviceId, action: 'export', status, count, processed: status === 'completed' ? count : 0, deleted: 0, result: status === 'completed' ? { count, batchSize: 500, batchCount: Math.ceil(count / 500) } : null };
+  }
+  await test('export selected sends IDs and fingerprints only, no truncated row content or delete confirmation', async () => {
+    const h = await harness({ confirm: false }); try {
+      await h.select(); await h.load(); h.el('rows').querySelector('input').click();
+      h.setPostHook((payload, requests) => { const request = exportStatus(payload); requests.set(payload.requestId, request); return response(request); });
+      h.el('export').click(); await until(() => h.posts().length === 2 && !h.el('retry').disabled);
+      assert.equal(h.posts()[1].action, 'export'); assert.deepEqual(h.posts()[1].selection, { mode: 'selected', items: [{ id: '1', fingerprint: 'a'.repeat(64) }] });
+      assert.equal(h.el('export-files').hidden, true); assert.equal(h.el('delete-all').disabled, true);
+    } finally { h.close(); }
+  });
+  await test('filtered export and all-inbox export use separate scopes; all ignores invalid filters and locked default', async () => {
+    for (const mode of ['filter', 'all']) {
+      const h = await harness(); try {
+        await h.select(); await h.load(); h.input('keyword', 'literal'); await h.load();
+        if (mode === 'all') h.input('status-filter', '999');
+        h.setPostHook(payload => response(exportStatus(payload, 'completed')));
+        h.el(`export-${mode}`).click(); await until(() => h.posts().length === 3 && !h.el('load').disabled);
+        const payload = h.posts()[2]; assert.deepEqual(payload.selection, { mode: mode === 'all' ? 'all' : 'filtered' });
+        assert.equal(payload.filters.locked, mode === 'all' ? null : 0); assert.equal(payload.filters.keyword, mode === 'all' ? '' : 'literal');
+      } finally { h.close(); }
+    }
+  });
+  await test('full export beyond page size downloads server blob only after completion and survives filter edits', async () => {
+    const h = await harness({ postHook: (payload, requests) => { const value = exportStatus(payload); requests.set(payload.requestId, value); return response(value); } }); try {
+      await h.select(); h.el('export-all').click(); await until(() => h.posts().length === 1 && !h.el('retry').disabled);
+      assert.equal(h.el('export-files').hidden, true); const payload = h.posts()[0];
+      Object.assign(h.requests.get(payload.requestId), { status: 'running', processed: 500 }); await h.manager.poll();
+      assert.match(h.el('progress').textContent, /总计 501 · 已上传 500/); assert.equal(h.el('meter').hidden, false);
+      Object.assign(h.requests.get(payload.requestId), exportStatus(payload, 'completed')); await h.manager.poll();
+      assert.equal(h.el('export-files').hidden, false); h.input('keyword', 'changed');
+      h.el('export-xml').click(); await until(() => h.downloads.length === 1);
+      assert.equal(h.downloads[0].filename, `sms-export-${payload.requestId}.xml`); assert.equal(h.downloads[0].blob.size, 21);
+      assert.match(h.calls.at(-1).path, /export\?format=xml$/); assert.equal(h.posts().length, 1);
+      h.el('export-json').click(); await until(() => h.downloads.length === 2); assert.match(h.calls.at(-1).path, /format=json$/);
+    } finally { h.close(); }
+  });
+  await test('failed and incomplete exports never enable downloads or automatically POST', async () => {
+    for (const status of ['failed', 'interrupted', 'completed']) {
+      const h = await harness({ postHook: payload => response({ ...exportStatus(payload, status), processed: 1 }) }); try {
+        await h.select(); h.el('export-all').click(); await until(() => h.posts().length === 1 && !h.el('retry').disabled);
+        assert.equal(h.el('export-files').hidden, true); assert.equal(h.el('export-xml').disabled, true);
+        await h.manager.poll(); assert.equal(h.posts().length, 1);
+      } finally { h.close(); }
+    }
+  });
+  await test('export retries and refresh retain the original request; completion persists download buttons', async () => {
+    const database = new IDBFactory(), requests = new Map();
+    const first = await harness({ database, requests, postHook: (payload, records) => { records.set(payload.requestId, exportStatus(payload)); throw new Error('lost response'); } });
+    let original;
+    try { await first.select(); first.el('export-all').click(); await until(() => first.posts().length === 1 && !first.el('retry').disabled); original = first.posts()[0]; first.el('retry').click(); await until(() => first.posts().length === 2); assert.deepEqual(first.posts()[1], original); } finally { first.close(); }
+    const second = await harness({ database, requests });
+    try { await second.select(); assert.equal(second.posts().length, 0); assert.equal(second.el('retry').hidden, false); Object.assign(requests.get(original.requestId), exportStatus(original, 'completed')); await second.manager.poll(); assert.equal(second.el('export-files').hidden, false); } finally { second.close(); }
+    const third = await harness({ database, requests });
+    try { await third.select(); assert.equal(third.el('export-files').hidden, false); assert.equal(third.posts().length, 0); await third.select('phone-2'); assert.equal(third.el('export-files').hidden, true); } finally { third.close(); }
+  });
+  await test('late export response and late download never contaminate another device', async () => {
+    let release;
+    const h = await harness({ postHook: payload => new Promise(resolve => { release = () => resolve(response(exportStatus(payload, 'completed'))); }) });
+    try { await h.select(); h.el('export-all').click(); await until(() => release); await h.select('phone-2'); release(); await until(() => !h.el('load').disabled); assert.equal(h.el('export-files').hidden, true); } finally { h.close(); }
+    let releaseDownload;
+    const second = await harness({ postHook: payload => response(exportStatus(payload, 'completed')), downloadHook: () => new Promise(resolve => { releaseDownload = () => resolve({ blob: async () => new second.window.Blob(['data']) }); }) });
+    try { await second.select(); second.el('export-all').click(); await until(() => !second.el('export-files').hidden); second.el('export-json').click(); await until(() => releaseDownload); await second.select('phone-2'); releaseDownload(); await sleep(); assert.equal(second.downloads.length, 0); } finally { second.close(); }
+  });
+  await test('download errors never save an error response or create a new export', async () => {
+    const h = await harness({ postHook: payload => response(exportStatus(payload, 'completed')), downloadHook: () => { throw error(404); } });
+    try { await h.select(); h.el('export-all').click(); await until(() => !h.el('export-files').hidden); h.el('export-xml').click(); await until(() => h.el('notice').textContent.includes('下载失败')); assert.equal(h.downloads.length, 0); assert.equal(h.posts().length, 1); assert.equal(h.el('export-xml').disabled, false); } finally { h.close(); }
+  });
+  await test('export and deletion share one atomic per-device claim across tabs', async () => {
+    const database = new IDBFactory(); const first = await harness({ database }); const second = await harness({ database });
+    try { await first.select(); await second.select(); first.el('export-all').click(); second.el('delete-all').click(); await until(() => first.posts().length + second.posts().length === 1 && !first.el('retry').disabled && !second.el('retry').disabled); assert.equal(first.posts().length + second.posts().length, 1); } finally { first.close(); second.close(); }
   });
   console.log(`${tests} SMS manager tests passed`);
 })().catch(error => { console.error(error); process.exitCode = 1; });

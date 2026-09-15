@@ -3,6 +3,7 @@
 !desktop/
 !desktop/server.py
 !desktop/sms_management.py
+!desktop/sms_export.py
 !desktop/requirements.txt
 !desktop/static/
 !desktop/static/**

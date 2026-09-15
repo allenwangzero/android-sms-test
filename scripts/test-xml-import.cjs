@@ -41,6 +41,20 @@ async function main() {
   for (const [field, value] of [['read', 'null'], ['read', 'true'], ['read', ''], ['read', '2'], ['locked', '-1'], ['status', '256'], ['status', '1.0'], ['protocol', '-1'], ['protocol', '256'], ['toa', '145'], ['sc_toa', ''], ['subject', 'a'.repeat(4001)], ['service_center', 'a'.repeat(101)]]) {
     reject(xml(record.replace('/>', ` ${field}="${value}"/>`)), new RegExp(field));
   }
+  const ownXml = '<smses format="sms-test-v1" count="1"><sms address="A" body="a&#10;b&#13;c&#9;&amp;&lt;&gt;&quot;😀" date="123" type="1" protocol_null="true" subject="null" service_center_null="true" seen="1" read="0" date_sent="456"/></smses>';
+  const ownRecord = w.parseSmsXml(ownXml)[0];
+  assert.equal(ownRecord.body, 'a\nb\rc\t&<>"😀');
+  assert.equal(ownRecord.subject, 'null');
+  assert.equal(ownRecord.protocol, null);
+  assert.equal(ownRecord.service_center, null);
+  assert.equal(ownRecord.seen, 1);
+  assert.equal(ownRecord.date_sent, 456);
+  assert.equal(ownRecord.read, 0);
+  assert.deepEqual(JSON.parse(JSON.stringify(w.parseSmsJson(JSON.stringify([ownRecord]))[0])), JSON.parse(JSON.stringify(ownRecord)));
+  for (const invalid of ['{}', '[]', '[null]', '[1]', '{', JSON.stringify([{...ownRecord, body:''}]), JSON.stringify([{...ownRecord, timestamp:1.1}]), JSON.stringify([{...ownRecord, id:'1'}]), JSON.stringify([{...ownRecord, seen:2}])]) assert.throws(()=>w.parseSmsJson(invalid));
+  reject(ownXml.replace('seen="1"', 'seen="2"'), /seen/);
+  reject(ownXml.replace('date_sent="456"', 'date_sent="-1"'), /date_sent/);
+  reject(ownXml.replace('protocol_null="true"', 'protocol_null="false"'), /protocol_null/);
   const bulk = w.parseSmsXml(xml(record.repeat(2000), ' count="2000"'));
   assert.equal(bulk.length, 2000);
   assert.equal(w.parseSmsXml(xml(record.replace('Maya', '😀'.repeat(100)))).length, 1);
@@ -51,7 +65,7 @@ async function main() {
   evaluate(`draftLoaded = true; let writesForTest = []; let failForTest = false;
     draftOperation = async (action, value) => { if (failForTest) throw new Error('storage full'); writesForTest.push(value); };
     saveDraft = () => {};`);
-  const upload = (text, name = 'test.xml', size = 100) => w.importXmlFile({ name, size, text: async () => text });
+  const upload = (text, name = 'test.xml', size = 100) => w.importSmsFile({ name, size, text: async () => text });
   await upload(xml(enrichedRecord));
   assert.equal(evaluate('messages.length'), 1);
   assert.equal(evaluate('messages[0].read'), 0);
@@ -67,7 +81,7 @@ async function main() {
   await upload(xml(record.replace('type="1"', 'type="2"')));
   assert.equal(evaluate('messages.length'), 2001);
   assert.match(w.document.getElementById('notice').textContent, /原列表未改动/);
-  await upload(xml(record), 'big.xml', 64 * 1024 * 1024 + 1);
+  await upload(xml(record), 'big.xml', 256 * 1024 * 1024 + 1);
   assert.equal(evaluate('messages.length'), 2001);
   evaluate('failForTest = true');
   await upload(xml(record));
@@ -75,7 +89,7 @@ async function main() {
   assert.match(w.document.getElementById('notice').textContent, /storage full/);
   evaluate('failForTest = false');
   let finish;
-  const held = w.importXmlFile({ name: 'held.xml', size: 100, text: () => new Promise(resolve => { finish = resolve; }) });
+  const held = w.importSmsFile({ name: 'held.xml', size: 100, text: () => new Promise(resolve => { finish = resolve; }) });
   assert.equal(w.document.getElementById('import-xml').disabled, true);
   assert.equal(w.document.querySelector('#messages input').disabled, true);
   await upload(xml(record));
@@ -83,6 +97,12 @@ async function main() {
   await held;
   assert.equal(evaluate('messages.length'), 2002);
   assert.equal(w.document.getElementById('import-xml').disabled, false);
+  await upload(JSON.stringify([ownRecord]), 'export.json');
+  assert.equal(evaluate('messages.length'), 2003);
+  assert.equal(evaluate('messages[2002].body'), ownRecord.body);
+  assert.equal(evaluate('messages[2002].subject'), 'null');
+  assert.equal(evaluate('messages[2002].seen'), 1);
+  assert.equal(evaluate('messages[2002].date_sent'), 456);
   evaluate('messages = Array.from({length: 100000}, () => ({sender:"A",body:"B",timestamp:0}))');
   await upload(xml(record));
   assert.equal(evaluate('messages.length'), 100000);

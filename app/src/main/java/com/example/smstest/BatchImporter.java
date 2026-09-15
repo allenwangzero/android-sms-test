@@ -62,6 +62,8 @@ public final class BatchImporter {
                 || record.sender.codePointCount(0, record.sender.length()) > 100
                 || record.body.codePointCount(0, record.body.length()) > 4000
                 || record.type != 1
+                || record.seen < 0 || record.seen > 1
+                || record.dateSent < 0 || record.dateSent > 4102444800000L
                 || (record.protocol != null && (record.protocol < 0 || record.protocol > 255))
                 || (record.subject != null && record.subject.codePointCount(0, record.subject.length()) > 4000)
                 || (record.serviceCenter != null && record.serviceCenter.codePointCount(0, record.serviceCenter.length()) > 100)

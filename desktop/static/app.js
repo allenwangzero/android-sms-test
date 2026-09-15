@@ -193,7 +193,7 @@ function updateCounts() {
   $('previous').disabled = page === 0;
   $('next').disabled = page + 1 >= totalPages;
   $('import-xml').disabled = !draftLoaded || generating || importing;
-  $('import-xml').textContent = importing ? '正在解析 XML…' : '上传 XML 并追加';
+  $('import-xml').textContent = importing ? '正在解析文件…' : '导入 XML / JSON 并追加';
   $('add').disabled = !draftLoaded || generating || importing || messages.length >= MAX_COUNT;
   $('clear').disabled = !draftLoaded || generating || importing || messages.length === 0;
   updateSend();
@@ -508,13 +508,14 @@ async function cancelPendingUpload() {
   } finally { sending = false; updateSend(); }
 }
 
-async function importXmlFile(file) {
+async function importSmsFile(file) {
   if (!file || !draftLoaded || generating || importing) return;
   importing = true;
   renderMessages();
   try {
-    if (file.size > 64 * 1024 * 1024) throw new Error('XML 文件超过 64 MiB，请拆分后导入。');
-    const additions = parseSmsXml(await file.text());
+    if (file.size > 256 * 1024 * 1024) throw new Error('文件超过 256 MiB，请拆分后导入。');
+    const text = (await file.text()).replace(/^\uFEFF/, '');
+    const additions = text.trimStart().startsWith('<') ? parseSmsXml(text) : parseSmsJson(text);
     if (messages.length + additions.length > MAX_COUNT) throw new Error(`追加后超过 ${MAX_COUNT} 条，当前还可追加 ${MAX_COUNT - messages.length} 条。`);
     const combined = messages.concat(additions);
     const encoder = new TextEncoder();
@@ -533,7 +534,7 @@ async function importXmlFile(file) {
     notify(`已从 ${file.name} 追加 ${additions.length} 条短信，合计 ${messages.length} 条。请检查列表后发送到手机。`);
   } catch (error) {
     saveDraft();
-    notify(`XML 导入失败，原列表未改动：${error.message}`);
+    notify(`文件导入失败，原列表未改动：${error.message}`);
   } finally {
     importing = false;
     $('xml-file').value = '';
@@ -542,7 +543,7 @@ async function importXmlFile(file) {
 }
 
 $('import-xml').addEventListener('click', () => { if (draftLoaded && !generating && !importing) $('xml-file').click(); });
-$('xml-file').addEventListener('change', () => importXmlFile($('xml-file').files[0]));
+$('xml-file').addEventListener('change', () => importSmsFile($('xml-file').files[0]));
 
 $('generator').addEventListener('submit', async event => {
   event.preventDefault();

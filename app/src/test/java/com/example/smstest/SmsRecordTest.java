@@ -42,7 +42,7 @@ public final class SmsRecordTest {
         fields.put("sc_toa", null);
         SmsRecord record = SmsRecord.fromFields(fields);
         Map<String, Object> values = record.providerValues();
-        check(values.size() == 11 && !values.containsKey("toa") && !values.containsKey("sc_toa"));
+        check(values.size() == 12 && !values.containsKey("toa") && !values.containsKey("sc_toa"));
         check(values.get("address").equals(fields.get("sender")) && values.get("body").equals(fields.get("body"))
                 && values.get("date").equals(fields.get("timestamp")));
         check(values.get("type").equals(1) && values.get("protocol").equals(255));
@@ -57,7 +57,7 @@ public final class SmsRecordTest {
         for (String name : new String[] {"protocol", "subject", "service_center"}) {
             check(values.containsKey(name) && values.get(name) == null);
         }
-        for (String name : new String[] {"type", "protocol", "read", "status", "locked"}) {
+        for (String name : new String[] {"type", "protocol", "read", "status", "locked", "seen", "date_sent"}) {
             rejects(name, true);
             rejects(name, "1");
             rejects(name, 1.0);
@@ -86,6 +86,13 @@ public final class SmsRecordTest {
         }
         rejects("timestamp", true); rejects("timestamp", 1.0); rejects("timestamp", null);
         rejects("timestamp", -1L); rejects("timestamp", 4102444800001L);
+        fields = base();
+        fields.put("read", 0); fields.put("seen", 1); fields.put("date_sent", 1234567890123L);
+        values = SmsRecord.fromFields(fields).providerValues();
+        check(values.get("read").equals(0) && values.get("seen").equals(1));
+        check(values.get("date_sent").equals(1234567890123L));
+        rejects("seen", -1); rejects("seen", 2);
+        rejects("date_sent", -1L); rejects("date_sent", 4102444800001L);
         System.out.println("SmsRecord: " + assertions + " metadata parsing, boundary, preview and provider mapping checks passed");
     }
 }

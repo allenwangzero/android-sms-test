@@ -13,7 +13,7 @@ import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 try:
     from .sms_management import ManagementError, SmsManagement
@@ -21,7 +21,7 @@ except ImportError:  # 直接运行 desktop/server.py
     from sms_management import ManagementError, SmsManagement
 
 # 固定与当前管理端兼容的本地安装包，升级协议时同步更新。
-APK_VERSION = "v1.4.0"
+APK_VERSION = "v1.5.0"
 APK_FILENAME = f"android-sms-test-{APK_VERSION}.apk"
 APK_DOWNLOAD_PATH = f"/downloads/{APK_FILENAME}"
 
@@ -30,7 +30,8 @@ MAX_COUNT = 100000
 BATCH_SIZE = 500
 REQUIRED_SMS_FIELDS = {"sender", "body", "timestamp"}
 SMS_INTEGER_RANGES = {"type": (1, 1), "protocol": (0, 255), "read": (0, 1),
-                      "status": (-1, 255), "locked": (0, 1)}
+                      "status": (-1, 255), "locked": (0, 1), "seen": (0, 1),
+                      "date_sent": (0, 4102444800000)}
 SMS_TEXT_LIMITS = {"subject": 4000, "service_center": 100}
 SMS_FIELDS = REQUIRED_SMS_FIELDS | SMS_INTEGER_RANGES.keys() | SMS_TEXT_LIMITS.keys() | {"toa", "sc_toa"}
 MAX_SNAPSHOT = 256 * 1024 * 1024
@@ -419,8 +420,13 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/api/device/"):
             with store.lock:
                 store.device(self.token())
-            require(self.headers.get("X-SMS-Protocol") == "5", "请升级安卓工具至 v1.4.0 或更新版本以管理手机短信", 426)
+            require(self.headers.get("X-SMS-Protocol") == "6", "请升级安卓工具至 v1.5.0 或更新版本以管理手机短信", 426)
         parts = path.split("/")
+        if method == "GET" and len(parts) == 6 and parts[1:4] == ["api", "sms", "requests"] and parts[5] == "export":
+            formats = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+            require(set(formats) == {"format"} and len(formats["format"]) == 1, "请指定导出格式 xml 或 json")
+            content, mime, filename = store.export_document(parts[4], formats["format"][0])
+            return self.send(200, content, mime, filename)
         if method == "GET" and path == "/api/device/sms/requests":
             return self.send(200, store.pending_management(self.token()))
         if method == "GET" and len(parts) == 5 and parts[1:4] == ["api", "sms", "requests"]:
@@ -458,6 +464,9 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, store.pending(self.token()))
         if method == "POST":
             data = self.body()
+            if len(parts) == 9 and parts[1:5] == ["api", "device", "sms", "requests"] and parts[6:8] == ["export", "batches"]:
+                require(parts[8].isdigit() and len(parts[8]) <= 6, "导出分块索引无效")
+                return self.send(200, store.store_export_batch(self.token(), parts[5], int(parts[8]), data))
             if path == "/api/pairing/rotate":
                 return self.send(200, store.pairing(True))
             if path == "/api/pair":

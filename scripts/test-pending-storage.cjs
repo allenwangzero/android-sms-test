@@ -12,7 +12,7 @@ const { indexedDB } = require(process.argv[2] || 'fake-indexeddb');
 const appSource = fs.readFileSync(path.join(__dirname, '../desktop/static/app.js'), 'utf8');
 const storageSource = appSource.slice(0, appSource.indexOf('\nfunction notify('));
 const draftSource = appSource.slice(appSource.indexOf('function draftOperation('), appSource.indexOf('function localDate('));
-const submitSource = appSource.slice(appSource.indexOf('function hasContent('), appSource.indexOf("\nasync function importXmlFile("));
+const submitSource = appSource.slice(appSource.indexOf('function hasContent('), appSource.indexOf("\nasync function importSmsFile("));
 assert.ok(storageSource.includes('function pendingOperation('), 'Load the actual production persistence implementation');
 
 async function tab(origin = 'http://127.0.0.1:8765', adminToken = 'admin-a') {
@@ -245,7 +245,7 @@ async function run() {
 
   const metadataTab = await tab('http://127.0.0.1:8767', 'metadata');
   const rich = batch('metadata-snapshot');
-  Object.assign(rich.messages[0], { type: 1, protocol: null, subject: 'A&B', service_center: '+63917', read: 0, status: 64, locked: 1, toa: null, sc_toa: null });
+  Object.assign(rich.messages[0], { type: 1, protocol: null, subject: 'A&B', service_center: '+63917', read: 0, seen: 1, date_sent: 1789372799000, status: 64, locked: 1, toa: null, sc_toa: null });
   await metadataTab.draft('write', rich.messages);
   const richRestored = await metadataTab.restoreDraft();
   assert.deepEqual(JSON.parse(JSON.stringify(richRestored)), rich.messages);

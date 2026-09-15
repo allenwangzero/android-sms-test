@@ -24,15 +24,15 @@
       </aside>
       <div class="workspace">
         <div class="module-tabs" role="tablist" aria-label="短信操作模块">
-          <button id="tab-write" type="button" role="tab" aria-selected="true" aria-controls="module-write" tabindex="0"><strong>短信写入</strong><span>生成 / XML 导入 / 写入进度</span></button>
-          <button id="tab-delete" type="button" role="tab" aria-selected="false" aria-controls="module-delete" tabindex="-1"><strong>短信读取与删除</strong><span>读取 / 筛选删除 / 批次清理</span></button>
+          <button id="tab-write" type="button" role="tab" aria-selected="true" aria-controls="module-write" tabindex="0"><strong>短信写入</strong><span>生成 / 文件导入 / 写入进度</span></button>
+          <button id="tab-delete" type="button" role="tab" aria-selected="false" aria-controls="module-delete" tabindex="-1"><strong>短信读取与删除</strong><span>读取导出 / 删除 / 批次清理</span></button>
         </div>
         <div id="module-write" class="module-panel" role="tabpanel" aria-labelledby="tab-write">
         <section class="card"><div class="section-title"><h2>写入目标设备</h2><span id="device-count" class="badge">0 台</span></div><div id="devices" class="devices"><p class="empty">还没有连接的手机</p></div><small>勾选接收本次写入的手机，可多选。手机工具需保持前台；超过 10 秒未响应显示离线。</small></section>
         <section class="card"><div class="section-title"><h2>编排短信</h2><span id="draft-status" class="muted">草稿仅保存在当前浏览器</span></div>
           <form id="generator"><div class="generate-grid"><label>生成数量<input id="quantity" type="number" min="1" max="100000" step="1" value="10" required></label><label>统一发送人（可选）<input id="sender-template" maxlength="100" placeholder="留空则随机生成手机号"></label></div><label>内容模板（可选）<textarea id="body-template" rows="2" maxlength="4000" placeholder="留空使用带【测试】标记的随机短信"></textarea></label><div class="generator-footer"><small>支持 {code} 随机 6 位数字、{index} 本次生成序号。自定义内容不添加前缀。</small><button id="generate" type="submit" class="secondary">随机生成并追加</button></div></form>
-          <div class="table-toolbar"><strong id="message-count">0 条短信</strong><div class="actions"><button id="import-xml" class="secondary">上传 XML 并追加</button><input id="xml-file" type="file" accept=".xml,text/xml,application/xml" aria-label="选择短信 XML 文件" hidden><button id="add" class="secondary">＋ 新增一条</button><button id="clear" class="text-button danger">清空列表</button></div></div>
-          <small>支持 smses / sms 格式的收件短信 XML，保留类型、协议、主题、服务中心、已读、状态和锁定字段。类型及状态列为只读预览；单文件最多 64 MiB。</small>
+          <div class="table-toolbar"><strong id="message-count">0 条短信</strong><div class="actions"><button id="import-xml" class="secondary">导入 XML / JSON 并追加</button><input id="xml-file" type="file" accept=".xml,.json,text/xml,application/xml,application/json" aria-label="选择短信 XML 或 JSON 文件" hidden><button id="add" class="secondary">＋ 新增一条</button><button id="clear" class="text-button danger">清空列表</button></div></div>
+          <small>支持收件短信 XML 和本工具导出的 JSON，保留已读、状态、锁定、seen 和 date_sent 等支持的字段。导入会追加到当前列表；迁移前请清空草稿并检查导入结果。单文件最多 256 MiB。</small>
           <div class="table-scroll"><table><thead><tr><th class="index-col">序号</th><th class="sender-col">发送人</th><th>短信内容</th><th class="date-col">接收时间（电脑本地时间）</th><th class="metadata-col">类型 type</th><th class="metadata-col">已读 read</th><th class="metadata-col">状态 status</th><th class="metadata-col">锁定 locked</th><th class="delete-col"></th></tr></thead><tbody id="messages"></tbody></table><div id="messages-empty" class="empty big">还没有短信。随机生成一批，或新增一条自定义内容。</div></div>
           <div class="pagination"><span id="page-info">第 1 / 1 页</span><div class="actions"><button id="previous" class="secondary">上一页</button><button id="next" class="secondary">下一页</button></div></div>
           <div class="send-bar"><div><strong id="selection-summary">请选择目标手机</strong><p>最多 100,000 条，自动每 500 条分批传输。手机确认一次后依次导入，失败停止。</p></div><button id="send" class="primary">发送到手机</button></div>

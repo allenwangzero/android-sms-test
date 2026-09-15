@@ -376,7 +376,7 @@ public final class LanClient {
         connection.setConnectTimeout(5000);
         connection.setReadTimeout(10000);
         connection.setRequestProperty("Accept", "application/json");
-        connection.setRequestProperty("X-SMS-Protocol", "5");
+        connection.setRequestProperty("X-SMS-Protocol", "6");
         if (!bearer.isEmpty()) connection.setRequestProperty("Authorization", "Bearer " + bearer);
         try {
             if (data != null) {

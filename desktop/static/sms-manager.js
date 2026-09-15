@@ -1,4 +1,4 @@
-/* Phone inventory and deletion are separate from the import draft. */
+/* Phone inventory, export and deletion are separate from the import draft. */
 (function () {
   'use strict';
   const terminal = new Set(['completed', 'failed', 'interrupted', 'cancelled']);
@@ -14,7 +14,7 @@
         <div class="table-scroll"><table><thead><tr><th>导入时间</th><th>批次 ID</th><th>原任务状态</th><th>计划条数</th><th>已记录条数</th><th>操作</th></tr></thead><tbody id="sm-batches-rows"></tbody></table></div>
         <div class="pagination"><span id="sm-batches-info">尚未读取导入批次</span><div class="actions"><button id="sm-batches-prev" class="secondary">上一页</button><button id="sm-batches-next" class="secondary">下一页</button></div></div>
       </section>
-      <h3>按短信筛选清理</h3>
+      <h3>短信筛选、导出与清理</h3>
       <div class="sm-filters">
         <label>发送人（精确匹配）<input id="sm-sender" maxlength="100"></label><label>内容关键词（字面包含）<input id="sm-keyword" maxlength="4000"></label>
         <label>起始时间（本地时间，包含）<input id="sm-from" type="datetime-local" step="1"></label><label>截止时间（本地时间，包含）<input id="sm-to" type="datetime-local" step="1"></label>
@@ -27,12 +27,19 @@
       <div class="table-toolbar sm-wrap"><strong id="sm-selection">已选择 0 条</strong><div class="actions sm-wrap"><button id="sm-page-select" class="secondary">选择当前页</button><button id="sm-filter-select" class="secondary">选择全部筛选结果</button><button id="sm-unselect" class="text-button">取消选择</button></div></div>
       <div class="table-scroll"><table class="sm-table"><thead><tr><th>选择</th><th>发送人</th><th>短信内容</th><th>时间</th><th>read</th><th>status</th><th>locked</th><th>type</th></tr></thead><tbody id="sm-rows"></tbody></table></div>
       <div class="pagination"><span id="sm-page-info">尚未读取</span><div class="actions"><button id="sm-prev" class="secondary">上一页</button><button id="sm-next" class="secondary">下一页</button></div></div>
+      <section aria-labelledby="sm-export-heading">
+        <h3 id="sm-export-heading">导出手机收件短信</h3>
+        <div class="actions sm-wrap"><button id="sm-export" class="secondary">导出选中短信</button><button id="sm-export-filter" class="secondary">导出全部筛选结果</button><button id="sm-export-all" class="primary">导出全部收件短信</button></div>
+        <p>导出包含完整正文及支持的字段，仅包含收件短信。普通筛选默认排除锁定短信；“全部收件短信”包含锁定短信，不受筛选影响。导出不会删除短信。</p>
+        <div id="sm-export-files" hidden><p id="sm-export-info"></p><div class="actions"><button id="sm-export-xml" class="secondary">下载 XML</button><button id="sm-export-json" class="secondary">下载 JSON</button></div></div>
+        <small>先导出并确认文件可导入，再清空目标设备（需在手机确认），最后导入文件。可保持收件短信内容与支持字段一致，系统短信 ID 不同。</small>
+      </section>
       <div class="actions sm-wrap"><button id="sm-delete" class="secondary danger">请求删除选中短信</button><button id="sm-delete-filter" class="secondary danger">请求删除全部筛选结果</button><button id="sm-delete-all" class="sm-danger">一键清空所有短信</button></div>
       <small>普通筛选默认排除锁定短信。“一键清空”包含锁定短信及全部类型；清空范围以手机准备删除时的快照为准。删除不可撤销，失败停止，不自动恢复删除。</small>
       <p id="sm-progress" role="status"></p><progress id="sm-meter" hidden aria-label="删除总进度"></progress>`;
     const el = id => document.getElementById(`sm-${id}`);
     let database, storageError = '', device = '', revision = 0, rows = [], total = null, page = 0, loadedKey = '', selected = new Map(), filtered = false, pending = null, busy = false, polling = false;
-    let batches = [], batchTotal = null, batchPage = 0;
+    let batches = [], batchTotal = null, batchPage = 0, exported = null, downloading = false, deviceRevision = 0;
     const filterIds = ['sender', 'keyword', 'from', 'to', 'read', 'status-filter', 'locked'];
     function filters() {
       const numeric = id => el(id).value === '' ? null : Number(el(id).value);
@@ -46,15 +53,17 @@
     }
     function key() { return JSON.stringify({ device, filters: filters() }); }
     function notice(message) { el('notice').textContent = message; el('notice').hidden = !message; }
-    function storage(action, value, target = device) {
+    function storage(action, value, target = device, slot = '') {
       return new Promise((resolve, reject) => {
         if (!database) return reject(new Error(storageError || '浏览器存储尚未就绪'));
         const tx = database.transaction('requests', action === 'read' ? 'readonly' : 'readwrite');
-        const store = tx.objectStore('requests'), storageKey = `${scope}|${target}`;
+        const store = tx.objectStore('requests'), storageKey = `${scope}|${target}${slot}`;
         let result;
         const request = store.get(storageKey);
         request.onsuccess = () => {
           result = request.result || null;
+          if (action === 'save') { store.put(value, storageKey); result = value; }
+          if (action === 'completeExport' && result && result.payload.requestId === value.id) store.put(value, `${storageKey}|export`);
           if (action === 'claim' && !result) { store.put(value, storageKey); result = value; }
           if (action === 'clear' && result && result.payload.requestId === value.payload.requestId) store.delete(storageKey);
         };
@@ -81,6 +90,13 @@
       el('delete').disabled = !available || (!selected.size && !filtered);
       el('delete-filter').disabled = !available || total === null || total === 0;
       el('delete-all').disabled = !available;
+      el('export').disabled = !available || (!selected.size && !filtered);
+      el('export-filter').disabled = !available || total === null || total === 0;
+      el('export-all').disabled = !available;
+      el('export-files').hidden = !exported || exported.deviceId !== device;
+      el('export-xml').disabled = downloading || el('export-files').hidden;
+      el('export-json').disabled = downloading || el('export-files').hidden;
+      el('export-info').textContent = exported ? `最近完整导出 ${exported.result.count} 条收件短信，可下载 XML 或 JSON。` : '';
       el('selection').textContent = filtered ? `已选择全部筛选结果（上次读取 ${total} 条，最终数量以手机预览为准）` : `已选择 ${selected.size} 条`;
       el('page-info').textContent = total === null ? '尚未读取 / 筛选已变更，请重新读取' : `共 ${total} 条 · 第 ${page + 1} / ${Math.max(1, Math.ceil(total / 50))} 页`;
     }
@@ -140,14 +156,21 @@
     function progress(request) {
       const count = request.count === null ? '待手机统计' : request.count;
       el('progress').textContent = request.action !== 'delete' ? `${request.action === 'batches' ? '读取导入批次' : '读取'}：${labels[request.status] || request.status}${request.error ? ` · ${request.error}` : ''}` : `删除：${labels[request.status] || request.status} · 总计 ${count} · 已处理 ${request.processed} · 已删除 ${request.deleted}${request.error ? ` · ${request.error}` : ''}`;
+      if (request.action === 'export') el('progress').textContent = `导出：${labels[request.status] || request.status} · 总计 ${count} · 已上传 ${request.processed || 0}${request.error ? ` · ${request.error}` : ''}`;
       if (request.action === 'delete' && request.result?.selectionMode === 'batch') el('progress').textContent += ` · 已不存在跳过 ${request.result.missing || 0} · 已变化跳过 ${request.result.changed || 0}`;
-      el('meter').hidden = request.action !== 'delete' || request.count === null;
+      el('meter').hidden = !['delete', 'export'].includes(request.action) || request.count === null;
+      el('meter').setAttribute('aria-label', request.action === 'export' ? '导出总进度' : '删除总进度');
       el('meter').max = request.count || 1; el('meter').value = request.processed || 0;
     }
     async function accept(request, record, rev, target) {
       if (request.id !== record.payload.requestId || request.deviceId !== target || request.action !== record.payload.action) throw new Error('服务器返回的管理请求不匹配，已停止更新。');
       if (target === device) progress(request);
       if (!terminal.has(request.status)) return;
+      if (request.status === 'completed' && request.action === 'export') {
+        const result = request.result;
+        if (!result || !Number.isSafeInteger(result.count) || result.count < 0 || result.batchSize !== 500 || result.batchCount !== Math.ceil(result.count / 500) || request.count !== result.count || request.processed !== result.count) throw new Error('导出尚未完整或响应格式错误，不能下载。');
+        await storage('completeExport', request, target);
+      }
       // Clear only this immutable request; another browser tab may already own a newer one.
       await storage('clear', record, target);
       if (target !== device || !pending || pending.payload.requestId !== request.id) return;
@@ -160,10 +183,12 @@
         const result = request.result;
         if (!validBatchPage(result, record.payload.page)) throw new Error('导入批次响应格式错误，请重新读取。');
         batches = result.batches; batchTotal = result.total; batchPage = result.page; renderBatches();
+      } else if (request.status === 'completed' && request.action === 'export') {
+        exported = request;
       } else if (request.action === 'delete') {
         invalidate(); invalidateBatches();
       }
-      if (request.status === 'failed' || request.status === 'interrupted') notice(`${request.error || '手机处理失败'}。已停止，不会自动继续删除；请重新读取核对剩余短信。`);
+      if (request.status === 'failed' || request.status === 'interrupted') notice(request.action === 'export' ? `${request.error || '导出失败'}。已停止，未生成完整文件；不会自动重新导出。` : `${request.error || '手机处理失败'}。已停止，不会自动继续删除；请重新读取核对剩余短信。`);
       render();
     }
     async function transmit(record, rev, target) {
@@ -190,7 +215,7 @@
       if (busy || pending || !device) return;
       busy = true; update(); const target = device, rev = revision;
       try {
-        const all = action === 'batches' || (action === 'delete' && ['all', 'batch'].includes(selection.mode));
+        const all = action === 'batches' || (['delete', 'export'].includes(action) && ['all', 'batch'].includes(selection.mode));
         const viewKey = all ? '' : key();
         const payload = { requestId: uuid(), deviceId: target, action, filters: all ? { sender: '', keyword: '', dateFrom: null, dateTo: null, read: null, status: null, locked: null } : filters() };
         if (action === 'list' || action === 'batches') payload.page = requestedPage; else payload.selection = selection;
@@ -198,6 +223,7 @@
         const record = await storage('claim', proposed, target);
         if (target === device) pending = record;
         if (record.payload.requestId !== proposed.payload.requestId) throw new Error('此手机已有未完成管理请求，已恢复原请求，请重试连接。');
+        if (action === 'export') { await storage('save', null, target, '|export'); if (target === device) exported = null; }
         notice(''); await transmit(record, rev, target);
       } catch (error) { if (target === device) notice(`${error.message}。若请求结果不确定，请重试连接原请求。`); }
       finally { busy = false; render(); }
@@ -208,7 +234,7 @@
       try {
         const response = await (await api(`/api/sms/requests/${encodeURIComponent(record.payload.requestId)}`)).json();
         await accept(response, record, rev, target);
-      } catch (error) { if (target === device) notice(`连接未确认：${error.message}。原请求已保留，可重试连接；不会创建重复删除任务。`); }
+      } catch (error) { if (target === device) notice(`连接未确认：${error.message}。原请求已保留，可重试连接；不会创建重复管理任务。`); }
       finally { polling = false; update(); }
     }
     async function restore() {
@@ -216,12 +242,12 @@
       pending = null; update();
       if (!target || !database) return;
       busy = true; update();
-      try { const saved = await storage('read', null, target); if (device === target) pending = saved; }
+      try { const saved = await storage('read', null, target); const lastExport = await storage('read', null, target, '|export'); if (device === target) { pending = saved; exported = lastExport; } }
       catch (error) { notice(error.message); }
       finally { busy = false; update(); }
       await poll();
     }
-    el('device').addEventListener('change', () => { device = el('device').value; invalidate(); invalidateBatches(); el('progress').textContent = ''; el('meter').hidden = true; notice(''); restore(); });
+    el('device').addEventListener('change', () => { device = el('device').value; deviceRevision++; exported = null; invalidate(); invalidateBatches(); el('progress').textContent = ''; el('meter').hidden = true; notice(''); restore(); });
     for (const id of filterIds) el(id).addEventListener('input', invalidate);
     el('batches-load').addEventListener('click', () => start('batches', null, 0));
     el('batches-prev').addEventListener('click', () => start('batches', null, batchPage - 1));
@@ -242,6 +268,31 @@
       const message = isAll ? `请求清空“${name}”的所有短信，包含锁定短信和所有类型。删除不可撤销。手机还会显示数量和样例，需在手机确认后才删除。继续？` : `请求删除“${name}”${selection.mode === 'filtered' ? '全部筛选结果（最终数量以手机预览为准）' : `选中的 ${selection.items.length} 条短信`}。删除不可撤销，仍需在手机确认。继续？`;
       if (window.confirm(message)) start('delete', selection);
     }
+    function exportRequest(mode) {
+      if (busy || pending || !device) return;
+      if (mode !== 'all' && (!loadedKey || loadedKey !== key())) return notice('筛选已变更，请重新读取后选择。');
+      const selection = mode === 'selected' ? (filtered ? { mode: 'filtered' } : { mode, items: [...selected.values()] }) : { mode };
+      if (selection.mode === 'selected' && !selection.items.length) return;
+      start('export', selection);
+    }
+    async function downloadExport(format) {
+      if (!exported || exported.deviceId !== device || downloading) return;
+      const request = exported, target = device, generation = deviceRevision;
+      downloading = true; update();
+      try {
+        const blob = await (await api(`/api/sms/requests/${encodeURIComponent(request.id)}/export?format=${format}`)).blob();
+        if (target !== device || generation !== deviceRevision || exported !== request) return;
+        const url = URL.createObjectURL(blob), link = document.createElement('a');
+        link.href = url; link.download = `sms-export-${request.id}.${format}`; document.body.append(link); link.click(); link.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+      } catch (error) { if (target === device && generation === deviceRevision) notice(`下载失败：${error.message}。可重试下载，不会重新导出。`); }
+      finally { downloading = false; update(); }
+    }
+    el('export').addEventListener('click', () => exportRequest('selected'));
+    el('export-filter').addEventListener('click', () => exportRequest('filtered'));
+    el('export-all').addEventListener('click', () => exportRequest('all'));
+    el('export-xml').addEventListener('click', () => downloadExport('xml'));
+    el('export-json').addEventListener('click', () => downloadExport('json'));
     el('delete').addEventListener('click', () => deleteRequest('selected'));
     el('delete-filter').addEventListener('click', () => deleteRequest('filtered'));
     el('delete-all').addEventListener('click', () => deleteRequest('all'));
@@ -269,7 +320,7 @@
         el('device').replaceChildren(new Option('请选择手机', ''));
         for (const item of devices) el('device').append(new Option(item.name || item.id, item.id));
         if (devices.some(item => item.id === old)) el('device').value = old;
-        else if (old) { device = ''; pending = null; invalidate(); invalidateBatches(); }
+        else if (old) { device = ''; deviceRevision++; exported = null; pending = null; invalidate(); invalidateBatches(); }
       },
       dispose() { clearInterval(timer); if (database) database.close(); },
       poll,

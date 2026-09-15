@@ -5,6 +5,7 @@ import android.content.Context;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.provider.Telephony;
+import android.util.Log;
 import org.json.JSONArray;
 import org.json.JSONObject;
 import java.io.IOException;
@@ -50,6 +51,7 @@ public final class SmsManagement {
     private final Context context;
     private final SharedPreferences prefs;
     private final SmsRepository repository;
+    private final SmsExportRepository exports;
     private final Host host;
     private volatile Pending pending;
 
@@ -58,6 +60,7 @@ public final class SmsManagement {
         this.prefs = prefs;
         this.host = host;
         repository = new SmsRepository(context, this::checkRead);
+        exports = new SmsExportRepository(context, this::checkExport);
     }
 
     public Pending pending() { return pending; }
@@ -69,11 +72,18 @@ public final class SmsManagement {
             String state = saved.getString("state");
             if ("preparing".equals(state) || "ready".equals(state) || "running".equals(state)) {
                 JSONObject previous = saved.getJSONObject("report");
-                JSONObject terminal = report(!"delete".equals(saved.getString("action")) ? "failed" : "interrupted",
+                JSONObject terminal = "export".equals(saved.getString("action"))
+                        ? exportReport("interrupted", previous.optInt("count", 0), previous.optInt("processed", 0),
+                                "应用进程中断，导出已停止，不会自动重新读取或续传，请在电脑新建导出任务。", null)
+                        : report(!"delete".equals(saved.getString("action")) ? "failed" : "interrupted",
                         previous.optInt("count", 0), previous.optInt("deleted", 0),
                         "应用进程中断，任务停止，不会自动续删。已删除数量为已确认下限；请重新读取手机短信。", null);
                 saved.put("state", terminal.getString("status")).put("report", terminal).put("acked", false);
-                host.save(entry.getKey(), saved.toString());
+                saveLedger(entry.getKey(), saved);
+            } else if ("export".equals(saved.getString("action")) && isTerminal(state)) {
+                // Includes exports completed before a previous cleanup failure or process exit.
+                try { clearExport(entry.getKey()); }
+                catch (Exception error) { logCleanupFailure(error); }
             }
         }
     }
@@ -103,7 +113,7 @@ public final class SmsManagement {
         String id = UUID.fromString(request.getString("id")).toString();
         if (!host.deviceId().equals(request.getString("deviceId"))) throw new IOException("短信管理任务设备不匹配");
         String action = request.getString("action");
-        if (!"list".equals(action) && !"batches".equals(action) && !"delete".equals(action)) throw new IOException("未知短信管理操作");
+        if (!"list".equals(action) && !"batches".equals(action) && !"delete".equals(action) && !"export".equals(action)) throw new IOException("未知短信管理操作");
         String raw = prefs.getString(key(id), null);
         if (raw != null) {
             JSONObject saved = new JSONObject(raw);
@@ -114,7 +124,10 @@ public final class SmsManagement {
             if (!"ready".equals(request.getString("status")) && !"running".equals(request.getString("status"))) {
                 throw new IOException("短信管理任务状态不兼容");
             }
-            JSONObject terminal = report(!"delete".equals(action) ? "failed" : "interrupted",
+            JSONObject terminal = "export".equals(action)
+                    ? exportReport("interrupted", request.optInt("count", 0), request.optInt("processed", 0),
+                            "本机没有该导出任务记录，已停止，请新建导出任务。", null)
+                    : report(!"delete".equals(action) ? "failed" : "interrupted",
                     request.optInt("count", 0), request.optInt("deleted", 0),
                     "本机没有该管理任务记录，已停止，禁止重复删除。", null);
             store(id, action, terminal.getString("status"), terminal);
@@ -126,7 +139,9 @@ public final class SmsManagement {
             // This marker precedes every provider read and immutable snapshot creation.
             store(id, action, "preparing", report("failed", 0, 0, "准备中", null));
             host.checkActive();
-            if ("batches".equals(action)) {
+            if ("export".equals(action)) {
+                export(id, request);
+            } else if ("batches".equals(action)) {
                 JSONObject rows = repository.listBatches(host.deviceId(), request.getInt("page"));
                 host.checkActive();
                 store(id, action, "completed", report("completed", rows.getInt("total"), 0, "", rows));
@@ -160,12 +175,41 @@ public final class SmsManagement {
             JSONObject saved = new JSONObject(prefs.getString(key(id), "{}"));
             JSONObject previous = saved.optJSONObject("report");
             int count = previous == null ? 0 : previous.optInt("count", 0);
-            store(id, action, "failed", report("failed", count, 0, errorText(error), null));
+            store(id, action, "failed", "export".equals(action)
+                    ? exportReport("failed", count, previous == null ? 0 : previous.optInt("processed", 0), errorText(error), null)
+                    : report("failed", count, 0, errorText(error), null));
             pending = null;
             host.result("短信管理任务失败：" + errorText(error));
         } finally { host.busy(false); }
         flush();
         return true;
+    }
+
+    private void export(String id, JSONObject request) throws Exception {
+        checkExport();
+        int count = exports.freeze(host.deviceId(), id, request.getJSONObject("filters"), request.getJSONObject("selection"));
+        JSONObject descriptor = new JSONObject().put("count", count).put("batchSize", SmsExporter.BATCH_SIZE)
+                .put("batchCount", (count + SmsExporter.BATCH_SIZE - 1) / SmsExporter.BATCH_SIZE);
+        JSONObject running = exportReport("running", count, 0, "", descriptor);
+        store(id, "export", "running", running);
+        post(id, running);
+        SmsExporter.run(count, new SmsExporter.Operations() {
+            @Override public void checkActive() throws Exception { checkExport(); }
+            @Override public void upload(int index, int offset, int expected) throws Exception {
+                JSONObject payload = exports.batch(host.deviceId(), id, offset, expected);
+                checkExport();
+                host.request("/api/device/sms/requests/" + id + "/export/batches/" + index, payload);
+            }
+            @Override public void progress(int processed) throws Exception {
+                JSONObject progress = exportReport("running", count, processed, "", null);
+                store(id, "export", "running", progress);
+                post(id, progress);
+                host.result("正在导出 " + processed + " / " + count + " 条短信，请保持手机前台。");
+            }
+        });
+        checkExport();
+        store(id, "export", "completed", exportReport("completed", count, count, "", null));
+        host.result("已导出 " + count + " 条收件短信，请在电脑下载 XML 或 JSON。手机短信未改变。");
     }
 
     public void confirm(String id, boolean accepted) throws Exception {
@@ -240,6 +284,13 @@ public final class SmsManagement {
         }
     }
 
+    private void checkExport() throws Exception {
+        checkRead();
+        if (!context.getPackageName().equals(Telephony.Sms.getDefaultSmsPackage(context))) {
+            throw new SecurityException("导出前请将本工具设为默认短信应用，以读取完整短信范围，然后在电脑重新提交任务");
+        }
+    }
+
     private void checkDelete() throws Exception {
         checkRead();
         if (!context.getPackageName().equals(Telephony.Sms.getDefaultSmsPackage(context))) {
@@ -250,8 +301,27 @@ public final class SmsManagement {
     private String prefix() { return "sms-manage:" + host.deviceId() + ":"; }
     private String key(String id) { return prefix() + id; }
     private void store(String id, String action, String state, JSONObject report) throws Exception {
-        host.save(key(id), new JSONObject().put("action", action).put("state", state)
-                .put("report", report).put("acked", false).toString());
+        saveLedger(key(id), new JSONObject().put("action", action).put("state", state)
+                .put("report", report).put("acked", false));
+    }
+    private void saveLedger(String ledgerKey, JSONObject saved) throws Exception {
+        if (!"export".equals(saved.getString("action")) || !isTerminal(saved.getString("state"))) {
+            host.save(ledgerKey, saved.toString());
+            return;
+        }
+        Exception cleanupFailure = SmsExporter.finish(new SmsExporter.LedgerCleanup() {
+            @Override public void persist() throws Exception { host.save(ledgerKey, saved.toString()); }
+            @Override public void clearSnapshot() throws Exception { clearExport(ledgerKey); }
+        });
+        if (cleanupFailure != null) logCleanupFailure(cleanupFailure);
+    }
+    private void clearExport(String ledgerKey) throws Exception {
+        String[] parts = ledgerKey.split(":", -1);
+        if (parts.length != 3 || !"sms-manage".equals(parts[0])) throw new IOException("导出任务记录标识无效");
+        exports.clear(parts[1], parts[2]);
+    }
+    private static void logCleanupFailure(Exception error) {
+        Log.w("SmsExport", "Private snapshot cleanup failed; retained terminal ledger, retry on next startup", error);
     }
     private void post(String id, JSONObject report) throws Exception {
         host.request("/api/device/sms/requests/" + id + "/status", report);
@@ -259,6 +329,10 @@ public final class SmsManagement {
     private static JSONObject report(String status, int count, int deleted, String error, JSONObject result) throws Exception {
         return new JSONObject().put("status", status).put("count", count).put("processed", deleted)
                 .put("deleted", deleted).put("error", error).put("result", result == null ? JSONObject.NULL : result);
+    }
+    private static JSONObject exportReport(String status, int count, int processed, String error, JSONObject result) throws Exception {
+        return new JSONObject().put("status", status).put("count", count).put("processed", processed)
+                .put("deleted", 0).put("error", error).put("result", result == null ? JSONObject.NULL : result);
     }
     private static boolean isTerminal(String state) {
         return "completed".equals(state) || "failed".equals(state) || "interrupted".equals(state) || "cancelled".equals(state);
