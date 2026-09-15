@@ -7,9 +7,9 @@ import java.util.List;
 public final class BatchImporterTest {
     private static final class Harness implements BatchImporter.Operations {
         final int total;
-        int inserts, durable, acknowledged, fetched;
+        int inserts, recorded, durable, acknowledged, fetched;
         int failInsert = -1, failPersist = -1, failReport = -1, failFetch = -1, invalidBatch = -1;
-        int stopAt = -1, invalidMetadataBatch = -1;
+        int stopAt = -1, invalidMetadataBatch = -1, failRecord = -1;
         Harness(int total) { this.total = total; }
         @Override public void checkActive() throws Exception {
             if (inserts == stopAt) throw new IOException("background");
@@ -34,7 +34,13 @@ public final class BatchImporterTest {
             if (!record.body.equals("record-" + inserts)) throw new AssertionError("Duplicated or reordered record");
             inserts++;
         }
+        @Override public void recordInserted(int written) throws Exception {
+            if (written != inserts || written != recorded + 1) throw new AssertionError("Identity recorded out of order");
+            if (written == failRecord) throw new IOException("identity journal disk");
+            recorded = written;
+        }
         @Override public void persist(int written) throws Exception {
+            if (written != recorded) throw new AssertionError("Progress saved before identity journal");
             if (written == failPersist) throw new IOException("disk");
             durable = written;
         }
@@ -53,10 +59,14 @@ public final class BatchImporterTest {
             Harness h = new Harness(total);
             BatchImporter.Outcome result = BatchImporter.run(total, h);
             check(result.error == null && result.written == total && h.inserts == total
-                    && h.durable == total && h.acknowledged == total && h.fetched == (total + 499) / 500);
+                    && h.recorded == total && h.durable == total && h.acknowledged == total && h.fetched == (total + 499) / 500);
         }
         Harness provider = new Harness(1001); provider.failInsert = 507;
         failed(provider, 507, 2);
+        Harness identity = new Harness(1001); identity.failRecord = 501;
+        failed(identity, 501, 2); check(identity.recorded == 500 && identity.durable == 500);
+        Harness firstIdentity = new Harness(1001); firstIdentity.failRecord = 1;
+        failed(firstIdentity, 1, 1); check(firstIdentity.recorded == 0);
         Harness disk = new Harness(1001); disk.failPersist = 501;
         failed(disk, 501, 2); check(disk.durable == 500);
         Harness network = new Harness(1001); network.failFetch = 1;
@@ -75,7 +85,7 @@ public final class BatchImporterTest {
         failed(initialDisk, 0, 0);
         Harness initialReport = new Harness(1001); initialReport.failReport = 0;
         failed(initialReport, 0, 0);
-        System.out.println("BatchImporter: 18 boundary and failure-stop scenarios passed");
+        System.out.println("BatchImporter: 20 boundary and failure-stop scenarios passed");
     }
     private static void failed(Harness h, int written, int fetched) {
         BatchImporter.Outcome result = BatchImporter.run(h.total, h);

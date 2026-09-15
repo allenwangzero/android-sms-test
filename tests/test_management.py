@@ -160,6 +160,109 @@ class ManagementTests(unittest.TestCase):
         finally:
             reopened.db.close()
 
+    @staticmethod
+    def batch(**values):
+        return dict(dict(jobId=str(uuid.uuid4()), createdAt=123, requested=100,
+                         recorded=50, status='interrupted'), **values)
+
+    def test_batches_pagination_read_only_and_persistent_replay(self):
+        request = self.request('batches', page=1, filters={'sender': 'ignored', 'locked': 1})
+        self.store.create_management(request)
+        self.assertEqual(validate_request(request)['filters'], validate_request(self.request())['filters'])
+        self.assertEqual(self.store.create_management(request),
+                         self.store.create_management(dict(request, filters={})))
+        self.assert_error(400, validate_request, dict(request, selection={'mode': 'all'}))
+        result = dict(total=51, page=1, pageSize=50, batches=[self.batch()])
+        self.assert_error(409, self.report, request, 'ready', 51, 0, 0, result)
+        self.assert_error(400, self.report, request, 'completed', 51, 1, 0, result)
+        self.assert_error(400, self.report, request, 'completed', 51)
+        for invalid in (dict(result, page=0), dict(result, pageSize=True), dict(result, total=52),
+                        dict(result, batches=[]), dict(result, rows=[])):
+            self.assert_error(400, self.report, request, 'completed', 51, 0, 0, invalid)
+        done = self.report(request, 'completed', 51, result=result)
+        self.assertEqual(done, self.report(request, 'completed', 51, result=result))
+        reopened = Store(self.path, self.store.server_url)
+        try:
+            self.assertEqual(reopened.create_management(request), done)
+        finally:
+            reopened.db.close()
+        empty = self.request('batches', page=3)
+        self.store.create_management(empty)
+        self.report(empty, 'completed', result=dict(total=0, page=3, pageSize=50, batches=[]))
+        failed = self.request('batches')
+        self.store.create_management(failed)
+        self.report(failed, 'failed', error='无法读取批次记录')
+
+    def test_batches_validate_metadata_duplicates_and_page_length(self):
+        request = self.request('batches')
+        self.store.create_management(request)
+        batch = self.batch()
+        examples = [{'jobId': 'invalid'}, {'jobId': 'AAAAAAAA-AAAA-4AAA-AAAA-AAAAAAAAAAAA'}, {'createdAt': True},
+                    {'createdAt': -1}, {'requested': 0}, {'requested': 100001}, {'requested': True},
+                    {'recorded': -1}, {'recorded': 101}, {'recorded': True}, {'status': 'queued'},
+                    {'status': []}, {'extra': 1}]
+        for values in examples:
+            with self.subTest(values=values):
+                result = dict(total=1, page=0, pageSize=50, batches=[dict(batch, **values)])
+                self.assert_error(400, self.report, request, 'completed', 1, 0, 0, result)
+        duplicate = dict(total=2, page=0, pageSize=50, batches=[batch, batch])
+        self.assert_error(400, self.report, request, 'completed', 2, 0, 0, duplicate)
+        overflow = dict(total=51, page=0, pageSize=50, batches=[self.batch() for _ in range(51)])
+        self.assert_error(400, self.report, request, 'completed', 51, 0, 0, overflow)
+        for status in ('writing', 'completed', 'failed', 'interrupted'):
+            result = dict(total=1, page=0, pageSize=50, batches=[self.batch(status=status)])
+            current = request if status == 'writing' else self.request('batches')
+            if current is not request:
+                self.store.create_management(current)
+            self.report(current, 'completed', 1, result=result)
+
+    def test_batch_delete_normalizes_filters_and_validates_selection(self):
+        job_id = str(uuid.uuid4())
+        request = self.request('delete', page=4, filters={'sender': 'ignored', 'locked': 0},
+                               selection={'mode': 'batch', 'jobId': job_id})
+        normalized = validate_request(request)
+        self.assertEqual(normalized['filters']['sender'], '')
+        self.assertIsNone(normalized['filters']['locked'])
+        self.assertEqual(normalized['page'], 0)
+        self.assertEqual(normalized['selection'], request['selection'])
+        first = self.store.create_management(request)
+        self.assertEqual(first, self.store.create_management(dict(request, filters={}, page=0)))
+        self.assert_error(409, self.store.create_management,
+                          dict(request, selection={'mode': 'batch', 'jobId': str(uuid.uuid4())}))
+        for selection in ({'mode': 'batch'}, {'mode': 'batch', 'jobId': 'invalid'},
+                          {'mode': 'batch', 'jobId': job_id, 'items': []},
+                          {'mode': 'all', 'jobId': job_id}, {'mode': 'filtered', 'jobId': job_id},
+                          {'mode': 'selected', 'jobId': job_id, 'items': [{'id': '1', 'fingerprint': 'a' * 64}]}):
+            self.assert_error(400, validate_request, dict(request, selection=selection))
+
+    def test_batch_delete_preview_skip_counts_and_confirmation(self):
+        request = self.request('delete', selection={'mode': 'batch', 'jobId': str(uuid.uuid4())})
+        self.store.create_management(request)
+        result = dict(count=1, preview=[self.row()], selectionMode='batch',
+                      jobId=request['selection']['jobId'], missing=2, changed=3)
+        missing_field = dict(result)
+        del missing_field['missing']
+        missing_job = dict(result)
+        del missing_job['jobId']
+        for invalid in (missing_field, missing_job, dict(result, jobId=str(uuid.uuid4())),
+                        dict(result, jobId=None), dict(result, missing=True), dict(result, changed=-1),
+                        dict(result, missing=100001), dict(result, missing=99999, changed=1),
+                        dict(result, selectionMode='all')):
+            self.assert_error(400, self.report, request, 'ready', 1, 0, 0, invalid)
+        self.assert_error(409, self.report, request, 'running', 1)
+        self.report(request, 'ready', 1, result=result)
+        self.assert_error(400, self.report, request, 'running', 1, 1, 1)
+        self.report(request, 'running', 1)
+        self.assert_error(409, self.report, request, 'running', 1, 0, 0, dict(result, changed=4))
+        done = self.report(request, 'completed', 1, 1, 1)
+        self.assertEqual(done['result'], result)
+        self.assertEqual(done, self.report(request, 'completed', 1, 1, 1))
+        regular = self.request('delete', selection={'mode': 'all'})
+        self.store.create_management(regular)
+        self.assert_error(400, self.report, regular, 'ready', 1, 0, 0, dict(result, selectionMode='all'))
+        self.assert_error(400, self.report, regular, 'ready', 1, 0, 0,
+                          dict(count=1, preview=[], selectionMode='all', jobId=request['selection']['jobId']))
+
 
 if __name__ == '__main__':
     unittest.main()

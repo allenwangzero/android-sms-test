@@ -24,6 +24,11 @@ async function harness(options = {}) {
       if (postHook) return postHook(payload, requests);
       const old = requests.get(payload.requestId);
       if (old) return response(old);
+      if (payload.action === 'batches') {
+        const batch = index => ({ jobId: `import-${index}-01234567-89ab-cdef-0123-456789abcdef`, createdAt: 1700000000000, requested: 2000, recorded: index === 0 ? 0 : 1500, status: 'completed' });
+        const request = { id: payload.requestId, deviceId: payload.deviceId, action: 'batches', status: 'completed', count: null, processed: 0, deleted: 0, result: { total: 51, page: payload.page, pageSize: 50, batches: payload.page === 0 ? Array.from({ length: 50 }, (_, index) => batch(index)) : [batch(50)] } };
+        requests.set(payload.requestId, request); return response(request);
+      }
       const request = { id: payload.requestId, deviceId: payload.deviceId, action: payload.action, status: payload.action === 'list' ? 'completed' : 'ready', count: payload.action === 'list' ? 51 : 51, processed: 0, deleted: 0, error: '', result: payload.action === 'list' ? { total: 51, page: payload.page, pageSize: 50, rows: payload.page === 0 ? Array.from({ length: 50 }, (_, index) => row(index + 1)) : [row(51)] } : { count: 51, preview: [row(1)], selectionMode: payload.selection.mode } };
       requests.set(payload.requestId, request); return response(request);
     }
@@ -101,6 +106,87 @@ async function harness(options = {}) {
     const second = await harness({ database, postHook: () => { throw new Error('still offline'); } });
     try { await second.select(); assert.equal(second.el('retry').hidden, false); assert.equal(second.posts().length, 0); second.el('retry').click(); await until(() => second.posts().length === 1); assert.deepEqual(second.posts()[0], original); } finally { second.close(); }
     const other = await harness({ database, scope: 'origin|other-token' }); try { await other.select(); assert.equal(other.el('retry').hidden, true); assert.equal(other.calls.length, 0); } finally { other.close(); }
+  });
+  await test('batch inventory reads only on click, paginates and survives SMS filter edits', async () => {
+    const h = await harness(); try {
+      await h.select(); assert.equal(h.posts().length, 0);
+      h.input('status-filter', '999'); h.el('batches-load').click();
+      await until(() => h.el('batches-rows').children.length === 50 && !h.el('batches-load').disabled);
+      assert.equal(h.posts()[0].action, 'batches'); assert.equal(h.posts()[0].page, 0); assert.equal(h.posts()[0].filters.status, null);
+      const buttons = h.el('batches-rows').querySelectorAll('button'); assert.equal(buttons[0].disabled, true); assert.equal(buttons[1].disabled, false);
+      assert.match(h.el('batches-rows').textContent, /import-1-01234567-89ab-cdef-0123-456789abcdef/);
+      h.input('sender', 'new sender'); assert.equal(h.el('batches-rows').children.length, 50);
+      h.el('batches-next').click(); await until(() => h.el('batches-info').textContent.includes('第 2') && !h.el('batches-load').disabled);
+      assert.equal(h.posts()[1].page, 1); assert.equal(h.el('batches-rows').children.length, 1);
+      h.el('batches-prev').click(); await until(() => h.el('batches-info').textContent.includes('第 1') && !h.el('batches-load').disabled);
+    } finally { h.close(); }
+  });
+  await test('batch cleanup uses exact job ID independently of filters, displays skips and invalidates history on failure', async () => {
+    const h = await harness(); try {
+      await h.select(); h.el('batches-load').click(); await until(() => !h.el('batches-load').disabled);
+      h.input('status-filter', '999'); h.el('batches-rows').querySelectorAll('button')[1].click();
+      await until(() => h.posts().length === 2 && !h.el('retry').disabled);
+      const payload = h.posts()[1]; assert.deepEqual(payload.selection, { mode: 'batch', jobId: 'import-1-01234567-89ab-cdef-0123-456789abcdef' });
+      assert.equal(payload.filters.status, null); assert.equal(payload.filters.locked, null); assert.equal(payload.confirmed, undefined);
+      const request = h.requests.get(payload.requestId);
+      Object.assign(request, { status: 'failed', processed: 8, deleted: 8, error: 'provider stopped', result: { selectionMode: 'batch', missing: 2, changed: 3 } });
+      await h.manager.poll(); assert.match(h.el('progress').textContent, /已不存在跳过 2 · 已变化跳过 3/);
+      assert.equal(h.el('batches-rows').children.length, 0); assert.equal(h.el('retry').hidden, true);
+      await h.manager.poll(); assert.equal(h.posts().length, 2);
+    } finally { h.close(); }
+  });
+  await test('batch cleanup requires desktop confirmation', async () => {
+    const h = await harness({ confirm: false }); try {
+      await h.select(); h.el('batches-load').click(); await until(() => !h.el('batches-load').disabled);
+      h.el('batches-rows').querySelectorAll('button')[1].click(); await sleep(); assert.equal(h.posts().length, 1);
+    } finally { h.close(); }
+  });
+  await test('late batch response survives filter edits but never contaminates another device', async () => {
+    for (const switchDevice of [false, true]) {
+      let release;
+      const h = await harness({ postHook: payload => new Promise(resolve => { release = () => resolve(response({ id: payload.requestId, deviceId: payload.deviceId, action: 'batches', status: 'completed', count: null, result: { total: 1, page: 0, pageSize: 50, batches: [{ jobId: 'batch-one', createdAt: 1700000000000, requested: 10, recorded: 8, status: 'failed' }] } })); }) });
+      try {
+        await h.select(); h.el('batches-load').click(); await until(() => release);
+        if (switchDevice) await h.select('phone-2'); else h.input('keyword', 'changed');
+        release(); await until(() => !h.el('batches-load').disabled);
+        assert.equal(h.el('batches-rows').children.length, switchDevice ? 0 : 1);
+      } finally { h.close(); }
+    }
+  });
+  await test('uncertain batch cleanup preserves exact request and never automatically reposts', async () => {
+    const h = await harness(); try {
+      await h.select(); h.el('batches-load').click(); await until(() => !h.el('batches-load').disabled);
+      h.setPostHook(() => { throw new Error('connection lost'); });
+      h.el('batches-rows').querySelectorAll('button')[1].click(); await until(() => h.posts().length === 2 && !h.el('retry').disabled);
+      const original = h.posts()[1]; await h.manager.poll(); assert.equal(h.posts().length, 2);
+      h.el('retry').click(); await until(() => h.posts().length === 3); assert.deepEqual(h.posts()[2], original);
+    } finally { h.close(); }
+  });
+  await test('batch cleanup shares atomic per-device claims across tabs', async () => {
+    const database = new IDBFactory(); const first = await harness({ database }); const second = await harness({ database });
+    try {
+      await first.select(); await second.select();
+      first.el('batches-load').click(); await until(() => !first.el('batches-load').disabled);
+      second.el('batches-load').click(); await until(() => !second.el('batches-load').disabled);
+      first.el('batches-rows').querySelectorAll('button')[1].click(); second.el('delete-all').click();
+      await until(() => first.posts().length + second.posts().length === 3 && !first.el('retry').disabled && !second.el('retry').disabled);
+      assert.equal([...first.posts(), ...second.posts()].filter(payload => payload.action === 'delete').length, 1);
+    } finally { first.close(); second.close(); }
+  });
+  await test('refresh restores batch cleanup without creating a new request', async () => {
+    const database = new IDBFactory(); const first = await harness({ database });
+    let original;
+    try {
+      await first.select(); first.el('batches-load').click(); await until(() => !first.el('batches-load').disabled);
+      first.setPostHook(() => { throw new Error('lost response'); });
+      first.el('batches-rows').querySelectorAll('button')[1].click(); await until(() => first.posts().length === 2 && !first.el('retry').disabled);
+      original = first.posts()[1];
+    } finally { first.close(); }
+    const second = await harness({ database, postHook: () => { throw new Error('still offline'); } });
+    try {
+      await second.select(); assert.equal(second.el('retry').hidden, false); assert.equal(second.posts().length, 0);
+      second.el('retry').click(); await until(() => second.posts().length === 1); assert.deepEqual(second.posts()[0], original);
+    } finally { second.close(); }
   });
   console.log(`${tests} SMS manager tests passed`);
 })().catch(error => { console.error(error); process.exitCode = 1; });

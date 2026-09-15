@@ -11,6 +11,7 @@ public final class BatchImporter {
         void checkActive() throws Exception;
         List<SmsRecord> fetch(int index, int offset, int expected) throws Exception;
         void insert(SmsRecord record) throws Exception;
+        void recordInserted(int written) throws Exception;
         void persist(int written) throws Exception;
         void report(int written) throws Exception;
         void progress(int written, int batchIndex);
@@ -42,6 +43,8 @@ public final class BatchImporter {
                     operations.checkActive();
                     operations.insert(record);
                     written++;
+                    // Count the provider insertion even if recording its identity fails.
+                    operations.recordInserted(written);
                     operations.persist(written);
                     operations.progress(written, index);
                     if (written % 25 == 0) operations.report(written);

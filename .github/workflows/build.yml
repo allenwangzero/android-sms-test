@@ -35,7 +35,7 @@ jobs:
       - uses: actions/checkout@v4
       - run: docker compose -p sms-ci up -d --build --wait --wait-timeout 60
       - name: Test server inside Docker image
-        run: docker compose -p sms-ci run --rm --no-deps --entrypoint python -v "$PWD/tests:/app/tests:ro" desktop -m unittest discover -s tests -p 'test_*.py' -v
+        run: docker compose -p sms-ci run --rm --no-deps --entrypoint python -v "$PWD/tests:/app/tests:ro" -v "$PWD/app/src/main/java:/app/app/src/main/java:ro" desktop -m unittest discover -s tests -p 'test_*.py' -v
       - name: Clean up test containers and data
         if: always()
         run: docker compose -p sms-ci down -v

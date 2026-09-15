@@ -30,7 +30,7 @@ class ServerTests(unittest.TestCase):
 
     def call(self, path, data=None, token=None, headers=None):
         connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=3)
-        request_headers = {"Content-Type": "application/json", "X-SMS-Protocol": "4"}
+        request_headers = {"Content-Type": "application/json", "X-SMS-Protocol": "5"}
         if token:
             request_headers["Authorization"] = "Bearer " + token
         request_headers.update(headers or {})
@@ -98,7 +98,7 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(self.call(path + "/" + request["requestId"], token=self.admin)[1], queued)
         device_path = "/api/device/sms/requests"
         self.assertEqual(self.call(device_path)[0], 401)
-        for protocol in ("1", "2", "3"):
+        for protocol in ("1", "2", "3", "4"):
             self.assertEqual(self.call(device_path, token=first["deviceToken"], headers={"X-SMS-Protocol": protocol})[0], 426)
         self.assertEqual(self.call(device_path, token=second["deviceToken"])[1], {"request": None})
         self.assertEqual(self.call(device_path, token=first["deviceToken"])[1]["request"]["id"], request["requestId"])
@@ -112,6 +112,38 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(self.call(device_path, token=first["deviceToken"])[1], {"request": None})
         self.assertNotIn("sms_requests", self.call("/api/state", token=self.admin)[1])
 
+    def test_batch_history_and_cleanup_http(self):
+        first, second = self.device(), self.device()
+        path = "/api/sms/requests"
+        device_path = "/api/device/sms/requests"
+        job_id = str(uuid.uuid4())
+        history = {"requestId": str(uuid.uuid4()), "deviceId": first["deviceId"], "action": "batches", "page": 0}
+        self.assertEqual(self.call(path, history, self.admin)[0], 200)
+        self.assertIsNone(self.call(device_path, token=second["deviceToken"])[1]["request"])
+        self.assertEqual(self.call(device_path, token=first["deviceToken"])[1]["request"]["action"], "batches")
+        report = {"status": "completed", "count": 1, "processed": 0, "deleted": 0, "error": "",
+                  "result": {"total": 1, "page": 0, "pageSize": 50, "batches": [
+                      {"jobId": job_id, "createdAt": 123, "requested": 5, "recorded": 3, "status": "failed"}]}}
+        self.assertEqual(self.call(device_path + "/" + history["requestId"] + "/status", report, first["deviceToken"])[0], 200)
+        cleanup = {"requestId": str(uuid.uuid4()), "deviceId": first["deviceId"], "action": "delete",
+                   "selection": {"mode": "batch", "jobId": job_id}}
+        self.assertEqual(self.call(path, cleanup, self.admin)[0], 200)
+        pending = self.call(device_path, token=first["deviceToken"])[1]["request"]
+        self.assertEqual(pending["selection"], cleanup["selection"])
+        self.assertIsNone(pending["filters"]["locked"])
+        report = {"status": "ready", "count": 0, "processed": 0, "deleted": 0, "error": "",
+                  "result": {"count": 0, "preview": [], "selectionMode": "batch", "jobId": job_id, "missing": 2, "changed": 1}}
+        status_path = device_path + "/" + cleanup["requestId"] + "/status"
+        self.assertEqual(self.call(status_path, report, second["deviceToken"])[0], 404)
+        self.assertEqual(self.call(status_path, report, first["deviceToken"])[0], 200)
+        report["status"] = "completed"
+        self.assertEqual(self.call(status_path, report, first["deviceToken"])[0], 409)
+        report["status"] = "running"
+        self.assertEqual(self.call(status_path, report, first["deviceToken"])[0], 200)
+        report["status"] = "completed"
+        self.assertEqual(self.call(status_path, report, first["deviceToken"])[0], 200)
+        self.assertEqual(self.call(status_path, report, first["deviceToken"])[0], 200)
+
     def test_apk_download_qr(self):
         import qrcode
         self.server.apk_dir = Path(self.temp.name) / "dist"
@@ -124,8 +156,8 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(self.call("/api/apk/qr")[0], 401)
         status, download = self.call("/api/apk", token=self.admin)
         self.assertEqual(status, 200)
-        self.assertEqual(download["version"], "v1.3.0")
-        self.assertEqual(download["url"], "http://192.168.1.2:8765/downloads/android-sms-test-v1.3.0.apk")
+        self.assertEqual(download["version"], "v1.4.0")
+        self.assertEqual(download["url"], "http://192.168.1.2:8765/downloads/android-sms-test-v1.4.0.apk")
         with patch("qrcode.make", wraps=qrcode.make) as make:
             status, svg = self.call("/api/apk/qr", token=self.admin)
             self.assertEqual(status, 200)
@@ -353,10 +385,10 @@ class ServerTests(unittest.TestCase):
             for sms_status in (-1, 0, 32, 64, 255):
                 snapshot, _ = Store.validate_messages([dict(self.message(), type=sms_type, status=sms_status)])
                 self.assertEqual(json.loads(snapshot)[0]["status"], sms_status)
-        for protocol in ("1", "2", ""):
+        for protocol in ("1", "2", "3", "4", ""):
             status, result = self.call("/api/device/jobs", token=device["deviceToken"], headers={"X-SMS-Protocol": protocol})
             self.assertEqual(status, 426)
-            self.assertIn("v1.3.0", result["error"])
+            self.assertIn("v1.4.0", result["error"])
 
     def test_partial_upload_restart_conflicts_and_size_limit(self):
         device = self.device()

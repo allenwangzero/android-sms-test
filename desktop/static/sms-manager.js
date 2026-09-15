@@ -8,6 +8,13 @@
     root.innerHTML = `<div class="section-title"><h2>手机短信读取与删除</h2><span class="muted">读取、筛选与删除</span></div>
       <p>选择一台手机，点击读取。手机工具需保持前台并授予读取权限；完整列表和清空全部需先临时设为默认短信应用，否则系统可能仅返回收件和已发送短信。删除前会在手机再次确认。</p>
       <label>目标手机<select id="sm-device"><option value="">请选择手机</option></select></label>
+      <section class="sm-batches" aria-labelledby="sm-batches-heading">
+        <div class="section-title"><h3 id="sm-batches-heading">按导入批次清理</h3><button id="sm-batches-load" class="secondary">读取导入批次</button></div>
+        <p>每次完整导入为一个批次。从手机读取导入记录，仅支持升级后有记录的批次。清理不受下方短信筛选影响；已不存在的短信跳过，内容或字段已改变的短信不删除。仍需在手机确认。</p>
+        <div class="table-scroll"><table><thead><tr><th>导入时间</th><th>批次 ID</th><th>原任务状态</th><th>计划条数</th><th>已记录条数</th><th>操作</th></tr></thead><tbody id="sm-batches-rows"></tbody></table></div>
+        <div class="pagination"><span id="sm-batches-info">尚未读取导入批次</span><div class="actions"><button id="sm-batches-prev" class="secondary">上一页</button><button id="sm-batches-next" class="secondary">下一页</button></div></div>
+      </section>
+      <h3>按短信筛选清理</h3>
       <div class="sm-filters">
         <label>发送人（精确匹配）<input id="sm-sender" maxlength="100"></label><label>内容关键词（字面包含）<input id="sm-keyword" maxlength="4000"></label>
         <label>起始时间（本地时间，包含）<input id="sm-from" type="datetime-local" step="1"></label><label>截止时间（本地时间，包含）<input id="sm-to" type="datetime-local" step="1"></label>
@@ -25,6 +32,7 @@
       <p id="sm-progress" role="status"></p><progress id="sm-meter" hidden aria-label="删除总进度"></progress>`;
     const el = id => document.getElementById(`sm-${id}`);
     let database, storageError = '', device = '', revision = 0, rows = [], total = null, page = 0, loadedKey = '', selected = new Map(), filtered = false, pending = null, busy = false, polling = false;
+    let batches = [], batchTotal = null, batchPage = 0;
     const filterIds = ['sender', 'keyword', 'from', 'to', 'read', 'status-filter', 'locked'];
     function filters() {
       const numeric = id => el(id).value === '' ? null : Number(el(id).value);
@@ -58,6 +66,11 @@
       const available = !!device && !!database && !busy && !pending;
       const loaded = total !== null && rows.length > 0;
       el('load').disabled = !available;
+      el('batches-load').disabled = !available;
+      el('batches-prev').disabled = !available || batchTotal === null || batchPage === 0;
+      el('batches-next').disabled = !available || batchTotal === null || (batchPage + 1) * 50 >= batchTotal;
+      el('batches-info').textContent = batchTotal === null ? '尚未读取导入批次 / 数据已失效，请重新读取' : `共 ${batchTotal} 批 · 第 ${batchPage + 1} / ${Math.max(1, Math.ceil(batchTotal / 50))} 页`;
+      for (const button of el('batches-rows').querySelectorAll('button')) button.disabled = !available || button.dataset.recorded === '0';
       el('retry').hidden = !pending;
       el('retry').disabled = busy || polling;
       el('prev').disabled = !available || total === null || page === 0;
@@ -88,10 +101,46 @@
       }
       el('rows').replaceChildren(fragment); update();
     }
+    function validBatch(batch) {
+      if (!batch || typeof batch.jobId !== 'string' || !batch.jobId) return false;
+      if (!Number.isSafeInteger(batch.createdAt) || batch.createdAt < 0) return false;
+      if (!Number.isSafeInteger(batch.requested) || batch.requested < 1 || batch.requested > 100000) return false;
+      if (!Number.isSafeInteger(batch.recorded) || batch.recorded < 0 || batch.recorded > batch.requested) return false;
+      return ['writing', 'completed', 'failed', 'interrupted'].includes(batch.status);
+    }
+    function validBatchPage(result, requestedPage) {
+      if (!result || !Array.isArray(result.batches) || result.pageSize !== 50) return false;
+      if (!Number.isSafeInteger(result.total) || result.total < 0) return false;
+      if (!Number.isSafeInteger(result.page) || result.page < 0 || result.page !== requestedPage) return false;
+      const expectedCount = Math.min(50, Math.max(0, result.total - result.page * 50));
+      return result.batches.length === expectedCount && result.batches.every(validBatch);
+    }
+    function renderBatches() {
+      const fragment = document.createDocumentFragment();
+      const statuses = { writing: '写入中', completed: '已完成', failed: '失败', interrupted: '已中断' };
+      for (const batch of batches) {
+        const tr = document.createElement('tr');
+        for (const text of [new Date(batch.createdAt).toLocaleString(), batch.jobId, statuses[batch.status], batch.requested, batch.recorded]) {
+          const td = document.createElement('td'); td.textContent = String(text); tr.append(td);
+        }
+        tr.children[1].className = 'sm-batch-id';
+        const td = document.createElement('td'), button = document.createElement('button');
+        button.className = 'secondary danger'; button.textContent = '清理此批次'; button.dataset.recorded = String(batch.recorded);
+        button.addEventListener('click', () => {
+          if (busy || pending || !device || batch.recorded === 0 || !batches.includes(batch)) return;
+          const name = el('device').selectedOptions[0].textContent;
+          if (window.confirm(`请求清理“${name}”批次 ${batch.jobId} 已记录的 ${batch.recorded} 条短信。已改变的短信不删除，删除不可撤销，仍需在手机确认。继续？`)) start('delete', { mode: 'batch', jobId: batch.jobId });
+        });
+        td.append(button); tr.append(td); fragment.append(tr);
+      }
+      el('batches-rows').replaceChildren(fragment); update();
+    }
+    function invalidateBatches() { batches = []; batchTotal = null; batchPage = 0; renderBatches(); }
     function invalidate() { revision++; rows = []; total = null; loadedKey = ''; selected.clear(); filtered = false; page = 0; render(); }
     function progress(request) {
       const count = request.count === null ? '待手机统计' : request.count;
-      el('progress').textContent = request.action === 'list' ? `读取：${labels[request.status] || request.status}${request.error ? ` · ${request.error}` : ''}` : `删除：${labels[request.status] || request.status} · 总计 ${count} · 已处理 ${request.processed} · 已删除 ${request.deleted}${request.error ? ` · ${request.error}` : ''}`;
+      el('progress').textContent = request.action !== 'delete' ? `${request.action === 'batches' ? '读取导入批次' : '读取'}：${labels[request.status] || request.status}${request.error ? ` · ${request.error}` : ''}` : `删除：${labels[request.status] || request.status} · 总计 ${count} · 已处理 ${request.processed} · 已删除 ${request.deleted}${request.error ? ` · ${request.error}` : ''}`;
+      if (request.action === 'delete' && request.result?.selectionMode === 'batch') el('progress').textContent += ` · 已不存在跳过 ${request.result.missing || 0} · 已变化跳过 ${request.result.changed || 0}`;
       el('meter').hidden = request.action !== 'delete' || request.count === null;
       el('meter').max = request.count || 1; el('meter').value = request.processed || 0;
     }
@@ -107,8 +156,12 @@
         const result = request.result;
         if (!result || !Array.isArray(result.rows) || result.pageSize !== 50 || !Number.isSafeInteger(result.total) || result.total < 0 || result.page !== record.payload.page || result.rows.length > 50) throw new Error('短信列表响应格式错误，请重新读取。');
         rows = result.rows; total = result.total; page = result.page; loadedKey = record.viewKey;
+      } else if (request.status === 'completed' && request.action === 'batches') {
+        const result = request.result;
+        if (!validBatchPage(result, record.payload.page)) throw new Error('导入批次响应格式错误，请重新读取。');
+        batches = result.batches; batchTotal = result.total; batchPage = result.page; renderBatches();
       } else if (request.action === 'delete') {
-        invalidate();
+        invalidate(); invalidateBatches();
       }
       if (request.status === 'failed' || request.status === 'interrupted') notice(`${request.error || '手机处理失败'}。已停止，不会自动继续删除；请重新读取核对剩余短信。`);
       render();
@@ -137,10 +190,10 @@
       if (busy || pending || !device) return;
       busy = true; update(); const target = device, rev = revision;
       try {
-        const all = action === 'delete' && selection.mode === 'all';
+        const all = action === 'batches' || (action === 'delete' && ['all', 'batch'].includes(selection.mode));
         const viewKey = all ? '' : key();
         const payload = { requestId: uuid(), deviceId: target, action, filters: all ? { sender: '', keyword: '', dateFrom: null, dateTo: null, read: null, status: null, locked: null } : filters() };
-        if (action === 'list') payload.page = requestedPage; else payload.selection = selection;
+        if (action === 'list' || action === 'batches') payload.page = requestedPage; else payload.selection = selection;
         const proposed = { payload, viewKey };
         const record = await storage('claim', proposed, target);
         if (target === device) pending = record;
@@ -168,8 +221,11 @@
       finally { busy = false; update(); }
       await poll();
     }
-    el('device').addEventListener('change', () => { device = el('device').value; invalidate(); el('progress').textContent = ''; el('meter').hidden = true; notice(''); restore(); });
+    el('device').addEventListener('change', () => { device = el('device').value; invalidate(); invalidateBatches(); el('progress').textContent = ''; el('meter').hidden = true; notice(''); restore(); });
     for (const id of filterIds) el(id).addEventListener('input', invalidate);
+    el('batches-load').addEventListener('click', () => start('batches', null, 0));
+    el('batches-prev').addEventListener('click', () => start('batches', null, batchPage - 1));
+    el('batches-next').addEventListener('click', () => start('batches', null, batchPage + 1));
     el('load').addEventListener('click', () => start('list', null, 0));
     el('prev').addEventListener('click', () => start('list', null, page - 1));
     el('next').addEventListener('click', () => start('list', null, page + 1));
@@ -213,7 +269,7 @@
         el('device').replaceChildren(new Option('请选择手机', ''));
         for (const item of devices) el('device').append(new Option(item.name || item.id, item.id));
         if (devices.some(item => item.id === old)) el('device').value = old;
-        else if (old) { device = ''; pending = null; invalidate(); }
+        else if (old) { device = ''; pending = null; invalidate(); invalidateBatches(); }
       },
       dispose() { clearInterval(timer); if (database) database.close(); },
       poll,

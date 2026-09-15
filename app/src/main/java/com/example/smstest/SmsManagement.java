@@ -29,14 +29,20 @@ public final class SmsManagement {
         public final int count;
         public final String mode;
         public final String preview;
+        public final String batchSummary;
         Pending(String id, JSONObject prepared) throws Exception {
             this.id = id;
             count = prepared.getInt("count");
             mode = prepared.getString("selectionMode");
             preview = formatRows(prepared.getJSONArray("preview"));
+            batchSummary = "batch".equals(mode) ? "导入批次：" + prepared.getString("jobId")
+                    + "\n本次可清理 " + count + " 条；已不存在 " + prepared.getInt("missing")
+                    + " 条，字段已变化 " + prepared.getInt("changed") + " 条（均跳过）。\n"
+                    + (count == 0 ? "没有可删除目标；确认后仅完成本次任务。\n" : "")
+                    + "仅清理本机可靠记录且字段未变化的短信。\n" : "";
         }
         public String modeLabel() {
-            return "all".equals(mode) ? "清空所有短信（包含锁定短信，不包含彩信）"
+            return "batch".equals(mode) ? "清理本次导入批次" : "all".equals(mode) ? "清空所有短信（包含锁定短信，不包含彩信）"
                     : "filtered".equals(mode) ? "删除全部筛选结果" : "删除勾选的短信";
         }
     }
@@ -63,7 +69,7 @@ public final class SmsManagement {
             String state = saved.getString("state");
             if ("preparing".equals(state) || "ready".equals(state) || "running".equals(state)) {
                 JSONObject previous = saved.getJSONObject("report");
-                JSONObject terminal = report("list".equals(saved.getString("action")) ? "failed" : "interrupted",
+                JSONObject terminal = report(!"delete".equals(saved.getString("action")) ? "failed" : "interrupted",
                         previous.optInt("count", 0), previous.optInt("deleted", 0),
                         "应用进程中断，任务停止，不会自动续删。已删除数量为已确认下限；请重新读取手机短信。", null);
                 saved.put("state", terminal.getString("status")).put("report", terminal).put("acked", false);
@@ -97,7 +103,7 @@ public final class SmsManagement {
         String id = UUID.fromString(request.getString("id")).toString();
         if (!host.deviceId().equals(request.getString("deviceId"))) throw new IOException("短信管理任务设备不匹配");
         String action = request.getString("action");
-        if (!"list".equals(action) && !"delete".equals(action)) throw new IOException("未知短信管理操作");
+        if (!"list".equals(action) && !"batches".equals(action) && !"delete".equals(action)) throw new IOException("未知短信管理操作");
         String raw = prefs.getString(key(id), null);
         if (raw != null) {
             JSONObject saved = new JSONObject(raw);
@@ -108,7 +114,7 @@ public final class SmsManagement {
             if (!"ready".equals(request.getString("status")) && !"running".equals(request.getString("status"))) {
                 throw new IOException("短信管理任务状态不兼容");
             }
-            JSONObject terminal = report("list".equals(action) ? "failed" : "interrupted",
+            JSONObject terminal = report(!"delete".equals(action) ? "failed" : "interrupted",
                     request.optInt("count", 0), request.optInt("deleted", 0),
                     "本机没有该管理任务记录，已停止，禁止重复删除。", null);
             store(id, action, terminal.getString("status"), terminal);
@@ -119,17 +125,25 @@ public final class SmsManagement {
         try {
             // This marker precedes every provider read and immutable snapshot creation.
             store(id, action, "preparing", report("failed", 0, 0, "准备中", null));
-            checkRead();
-            if ("list".equals(action)) {
+            host.checkActive();
+            if ("batches".equals(action)) {
+                JSONObject rows = repository.listBatches(host.deviceId(), request.getInt("page"));
+                host.checkActive();
+                store(id, action, "completed", report("completed", rows.getInt("total"), 0, "", rows));
+                host.result("已读取本机导入批次，共 " + rows.getInt("total") + " 批；请在电脑选择要清理的批次。");
+            } else if ("list".equals(action)) {
+                checkRead();
                 JSONObject rows = repository.list(request.getJSONObject("filters"), request.getInt("page"));
                 host.checkActive();
                 store(id, action, "completed", report("completed", rows.getInt("total"), 0, "", rows));
                 host.result("已读取短信列表，共 " + rows.getInt("total") + " 条匹配；请在电脑勾选或筛选。\n"
                         + formatRows(rows.getJSONArray("rows")));
             } else {
-                if ("all".equals(request.getJSONObject("selection").getString("mode"))) {
+                checkRead();
+                String mode = request.getJSONObject("selection").getString("mode");
+                if ("all".equals(mode) || "batch".equals(mode)) {
                     if (!context.getPackageName().equals(Telephony.Sms.getDefaultSmsPackage(context))) {
-                        throw new SecurityException("清空所有短信前，请临时设为默认短信应用，以读取完整短信范围，然后在电脑重新提交清空任务");
+                        throw new SecurityException("清空短信或按批次清理前，请临时设为默认短信应用，以读取完整短信范围，然后在电脑重新提交任务");
                     }
                     checkDelete();
                 }
@@ -140,7 +154,7 @@ public final class SmsManagement {
                 store(id, action, "ready", ready);
                 post(id, ready);
                 pending = new Pending(id, prepared);
-                host.result("已准备删除 " + pending.count + " 条，等待手机确认。尚未删除任何短信。");
+                host.result(pending.batchSummary + "已准备删除 " + pending.count + " 条，等待手机确认。尚未删除任何短信。");
             }
         } catch (Exception error) {
             JSONObject saved = new JSONObject(prefs.getString(key(id), "{}"));

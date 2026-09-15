@@ -102,7 +102,7 @@ public final class MainActivity extends ComponentActivity {
         confirm = button(layout, "3. 确认写入完整任务", () -> {
             LanClient.Job job = client.getJob();
             if (job == null || client.isBusy()) return;
-            if (!isDefault()) { showMessage("请先设为默认短信应用"); return; }
+            if (!isDefault() || !canRead()) { showMessage("请先授权读取短信，并设为默认短信应用，以记录导入批次"); return; }
             new AlertDialog.Builder(this).setTitle("确认写入 " + job.count + " 条短信")
                     .setMessage("这些记录将追加到系统收件箱。确认一次后每 500 条自动分批导入；请保持前台，失败或离开前台即停止，不会自动续写。")
                     .setNegativeButton("返回检查", null)
@@ -113,7 +113,7 @@ public final class MainActivity extends ComponentActivity {
             if (pending == null || client.isBusy()) return;
             if (!isDefault() || !canRead()) { showMessage("请先授权读取，并设为默认短信应用"); return; }
             new AlertDialog.Builder(this).setTitle(pending.modeLabel())
-                    .setMessage("即将永久删除 " + pending.count + " 条手机短信，无法恢复。\n\n"
+                    .setMessage(pending.batchSummary + "即将永久删除 " + pending.count + " 条手机短信，无法恢复。\n\n"
                             + ("all".equals(pending.mode) ? "包含所有短信文件夹及锁定短信；不包含彩信。\n" : "范围为本次准备的固定短信列表。\n")
                             + "准备完成后新收到的短信不在本次删除范围内。\n"
                             + "确认一次后每 200 条分批删除；显示总进度，失败或离开前台即停止，已删除短信不会恢复。\n\n样例：\n" + pending.preview)
@@ -212,7 +212,7 @@ public final class MainActivity extends ComponentActivity {
         status.setText(client.getResult());
         makeDefault.setEnabled(!defaultApp && !busy);
         allowRead.setEnabled(!canRead() && !busy);
-        confirm.setEnabled(defaultApp && !busy && job != null);
+        confirm.setEnabled(defaultApp && canRead() && !busy && job != null);
         delete.setEnabled(defaultApp && canRead() && !busy && pending != null);
         delete.setText(pending == null ? "确认删除电脑选择的短信" : "确认" + pending.modeLabel() + "（" + pending.count + " 条）");
         cancelDelete.setEnabled(!busy && pending != null);
@@ -222,7 +222,7 @@ public final class MainActivity extends ComponentActivity {
         String nextId = pending != null ? "delete:" + pending.id : job == null ? "" : "import:" + job.id;
         if (!nextId.equals(previewId)) {
             previewId = nextId;
-            if (pending != null) preview.setText(pending.modeLabel() + " · 共 " + pending.count + " 条 · 预览前 10 条\n" + pending.preview);
+            if (pending != null) preview.setText(pending.batchSummary + pending.modeLabel() + " · 共 " + pending.count + " 条 · 预览前 10 条\n" + pending.preview);
             else if (job == null) preview.setText("");
             else {
                 StringBuilder content = new StringBuilder("任务共 " + job.count + " 条 · " + job.batchCount + " 批 · 预览前 20 条\n");

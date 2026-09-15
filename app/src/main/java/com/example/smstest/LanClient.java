@@ -29,6 +29,7 @@ public final class LanClient {
     private final Context context;
     private final SharedPreferences prefs;
     private final SmsManagement management;
+    private final SmsRepository imports;
     private final ScheduledExecutorService worker = Executors.newSingleThreadScheduledExecutor();
     private String baseUrl;
     private String token;
@@ -60,6 +61,7 @@ public final class LanClient {
         baseUrl = prefs.getString("url", "");
         token = prefs.getString("token", "");
         deviceId = prefs.getString("deviceId", "");
+        imports = new SmsRepository(context);
         management = new SmsManagement(context, prefs, new SmsManagement.Host() {
             @Override public String deviceId() { return deviceId; }
             @Override public JSONObject request(String path, JSONObject data) throws Exception {
@@ -75,6 +77,7 @@ public final class LanClient {
         worker.execute(() -> {
             try {
                 management.recover();
+                imports.recoverImports();
                 for (Map.Entry<String, ?> entry : prefs.getAll().entrySet()) {
                     if (!entry.getKey().startsWith("job:")) continue;
                     JSONObject ledger = new JSONObject((String) entry.getValue());
@@ -214,7 +217,7 @@ public final class LanClient {
 
     private Job parseJob(String id, JSONObject raw) throws Exception {
         if (!raw.has("batchSize") || !raw.has("batchCount") || !raw.has("preview")) {
-            throw new IOException("电脑端协议不兼容，请升级电脑端和手机 App 至 1.3.0 或更新版本");
+            throw new IOException("电脑端协议不兼容，请升级电脑端和手机 App 至 1.4.0 或更新版本");
         }
         int count = integer(raw, "count");
         if (count < 1 || count > 100000 || integer(raw, "batchSize") != BatchImporter.BATCH_SIZE
@@ -270,6 +273,7 @@ public final class LanClient {
         busy = true;
         stopped = !foreground;
         BatchImporter.Outcome outcome = BatchImporter.run(job.count, new BatchImporter.Operations() {
+            private Uri lastInserted;
             @Override public void checkActive() throws IOException {
                 if (stopped) throw new IOException("应用已离开前台，任务停止；不会自动续写");
             }
@@ -281,10 +285,17 @@ public final class LanClient {
                 }
                 return parseRecords(raw.getJSONArray("messages"), expected);
             }
-            @Override public void insert(SmsRecord record) throws Exception { SmsWriter.insert(context, record); }
+            @Override public void insert(SmsRecord record) throws Exception { lastInserted = SmsWriter.insert(context, record); }
+            @Override public void recordInserted(int written) throws Exception {
+                try { imports.recordInserted(deviceId, job.id, written, lastInserted); }
+                catch (Exception error) {
+                    throw new IOException("短信已写入，但批次记录保存失败；已停止，最后一条可能无法按批次清理：" + error.getMessage(), error);
+                }
+            }
             @Override public void persist(int written) throws Exception {
                 // Provider and preferences are not atomic: never replay after an interrupted commit.
                 save(key(job.id), ledger("writing", written, "").toString());
+                if (written == 0) imports.beginImport(deviceId, job.id, job.count);
             }
             @Override public void report(int written) throws Exception {
                 LanClient.this.report(job.id, ledger("writing", written, ""));
@@ -298,6 +309,7 @@ public final class LanClient {
         String status = outcome.error == null ? "completed" : "failed";
         String errorText = outcome.error == null ? "" : outcome.error.getClass().getSimpleName() + "：" + outcome.error.getMessage();
         try {
+            imports.finishImport(deviceId, job.id, status);
             save(key(job.id), ledger(status, written, errorText).toString());
         } catch (Exception error) {
             // A failed commit may still update the in-memory preferences map. Do not infer
@@ -364,7 +376,7 @@ public final class LanClient {
         connection.setConnectTimeout(5000);
         connection.setReadTimeout(10000);
         connection.setRequestProperty("Accept", "application/json");
-        connection.setRequestProperty("X-SMS-Protocol", "4");
+        connection.setRequestProperty("X-SMS-Protocol", "5");
         if (!bearer.isEmpty()) connection.setRequestProperty("Authorization", "Bearer " + bearer);
         try {
             if (data != null) {

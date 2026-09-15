@@ -11,7 +11,7 @@ import java.util.Map;
 public final class SmsWriter {
     private SmsWriter() { }
 
-    public static void insert(Context context, SmsRecord record) throws IOException {
+    public static Uri insert(Context context, SmsRecord record) throws IOException {
         if (!context.getPackageName().equals(Telephony.Sms.getDefaultSmsPackage(context))) {
             throw new SecurityException("默认短信应用已切换，写入停止");
         }
@@ -26,5 +26,6 @@ public final class SmsWriter {
         }
         Uri inserted = context.getContentResolver().insert(Telephony.Sms.CONTENT_URI, values);
         if (inserted == null) throw new IOException("系统短信数据库未返回写入结果");
+        return inserted;
     }
 }

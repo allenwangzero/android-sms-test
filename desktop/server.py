@@ -21,7 +21,7 @@ except ImportError:  # 直接运行 desktop/server.py
     from sms_management import ManagementError, SmsManagement
 
 # 固定与当前管理端兼容的本地安装包，升级协议时同步更新。
-APK_VERSION = "v1.3.0"
+APK_VERSION = "v1.4.0"
 APK_FILENAME = f"android-sms-test-{APK_VERSION}.apk"
 APK_DOWNLOAD_PATH = f"/downloads/{APK_FILENAME}"
 
@@ -419,7 +419,7 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/api/device/"):
             with store.lock:
                 store.device(self.token())
-            require(self.headers.get("X-SMS-Protocol") == "4", "请升级安卓工具至 v1.3.0 或更新版本以管理手机短信", 426)
+            require(self.headers.get("X-SMS-Protocol") == "5", "请升级安卓工具至 v1.4.0 或更新版本以管理手机短信", 426)
         parts = path.split("/")
         if method == "GET" and path == "/api/device/sms/requests":
             return self.send(200, store.pending_management(self.token()))

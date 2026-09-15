@@ -38,6 +38,14 @@ def fingerprint(value):
     require(isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value), "短信指纹无效")
 
 
+def canonical_uuid(value, name):
+    try:
+        valid = isinstance(value, str) and str(uuid.UUID(value)) == value
+    except (ValueError, AttributeError):
+        valid = False
+    require(valid, name + " 必须为规范 UUID")
+
+
 def canonical(data):
     return json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
@@ -46,13 +54,8 @@ def validate_request(data):
     object_fields(data, {"requestId", "deviceId", "action", "filters", "page", "selection"},
                   {"requestId", "deviceId", "action"})
     for key in ("requestId", "deviceId"):
-        value = data[key]
-        try:
-            valid = isinstance(value, str) and str(uuid.UUID(value)) == value
-        except (ValueError, AttributeError):
-            valid = False
-        require(valid, key + " 必须为规范 UUID")
-    require(data["action"] in ("list", "delete"), "请求操作无效")
+        canonical_uuid(data[key], key)
+    require(data["action"] in ("list", "batches", "delete"), "请求操作无效")
     filters = data.get("filters", {})
     object_fields(filters, DEFAULT_FILTERS)
     filters = DEFAULT_FILTERS | filters
@@ -66,12 +69,18 @@ def validate_request(data):
     page = data.get("page", 0)
     require(integer(page, 0, 10000000), "页码无效")
     result = dict(data, filters=filters, page=page)
-    if data["action"] == "list":
+    if data["action"] in ("list", "batches"):
         require("selection" not in data, "读取请求不能包含删除选择")
+        if data["action"] == "batches":
+            result["filters"] = dict(DEFAULT_FILTERS)
         return result
     selection = data.get("selection")
-    object_fields(selection, {"mode", "items"}, {"mode"})
-    require(selection["mode"] in ("selected", "filtered", "all"), "删除选择无效")
+    object_fields(selection, {"mode", "items", "jobId"}, {"mode"})
+    require(selection["mode"] in ("selected", "filtered", "all", "batch"), "删除选择无效")
+    if selection["mode"] == "batch":
+        canonical_uuid(selection.get("jobId"), "jobId")
+    else:
+        require("jobId" not in selection, "该选择模式不能指定批次")
     if selection["mode"] == "selected":
         items = selection.get("items")
         require(isinstance(items, list) and 1 <= len(items) <= 100000, "须选择 1–100000 条短信")
@@ -85,7 +94,7 @@ def validate_request(data):
         result["selection"] = {"mode": "selected", "items": sorted(items, key=lambda item: int(item["id"]))}
     else:
         require("items" not in selection, "该选择模式不能指定短信 ID")
-    if selection["mode"] == "all":
+    if selection["mode"] in ("all", "batch"):
         result["filters"] = DEFAULT_FILTERS | {"locked": None}
     result["page"] = 0
     return result
@@ -106,6 +115,21 @@ def validate_rows(rows, maximum):
         for key, low, high in (("timestamp", 0, 9223372036854775807), ("type", 0, 6),
                                ("read", 0, 1), ("locked", 0, 1), ("status", -1, 255)):
             require(integer(row[key], low, high), "预览 " + key + " 无效")
+
+
+def validate_batches(batches):
+    require(isinstance(batches, list) and len(batches) <= 50, "批次条数超过限制")
+    ids = set()
+    fields = {"jobId", "createdAt", "requested", "recorded", "status"}
+    for batch in batches:
+        object_fields(batch, fields, fields)
+        canonical_uuid(batch["jobId"], "jobId")
+        require(batch["jobId"] not in ids, "批次 ID 不能重复")
+        ids.add(batch["jobId"])
+        require(integer(batch["createdAt"], 0, 9223372036854775807), "批次时间无效")
+        require(integer(batch["requested"], 1, 100000), "批次目标数量无效")
+        require(integer(batch["recorded"], 0, batch["requested"]), "批次记录数量无效")
+        require(batch["status"] in ("writing", "completed", "failed", "interrupted"), "批次状态无效")
 
 
 class SmsManagement:
@@ -178,7 +202,7 @@ class SmsManagement:
                 return self.management_result(row)
             require(row["status"] not in TERMINAL, "请求已结束", 409)
             target = data["status"]
-            if row["action"] == "list":
+            if row["action"] in ("list", "batches"):
                 require(row["status"] == "queued" and target in {"completed", "failed"}, "读取状态流转无效", 409)
                 require(data["processed"] == data["deleted"] == 0, "读取请求不能删除短信")
             else:
@@ -194,20 +218,35 @@ class SmsManagement:
                 require(data["processed"] == data["count"], "完成状态须处理全部目标")
             result = data["result"]
             if result is not None:
-                if row["action"] == "list":
-                    object_fields(result, {"total", "page", "pageSize", "rows"}, {"total", "page", "pageSize", "rows"})
+                if row["action"] in ("list", "batches"):
+                    entries_key = "batches" if row["action"] == "batches" else "rows"
+                    fields = {"total", "page", "pageSize", entries_key}
+                    object_fields(result, fields, fields)
                     require(integer(result["total"], 0, 2147483647) and result["total"] == data["count"]
                             and type(result["pageSize"]) is int and result["pageSize"] == 50
                             and type(result["page"]) is int and result["page"] == json.loads(row["payload"])["page"], "列表分页无效")
-                    validate_rows(result["rows"], 50)
-                    require(len(result["rows"]) == min(50, max(0, result["total"] - result["page"] * 50)), "列表条数与分页不符")
+                    if row["action"] == "batches":
+                        validate_batches(result[entries_key])
+                    else:
+                        validate_rows(result[entries_key], 50)
+                    require(len(result[entries_key]) == min(50, max(0, result["total"] - result["page"] * 50)), "列表条数与分页不符")
                 else:
-                    object_fields(result, {"count", "preview", "selectionMode"}, {"count", "preview", "selectionMode"})
+                    selection = json.loads(row["payload"])["selection"]
+                    selection_mode = selection["mode"]
+                    fields = {"count", "preview", "selectionMode"}
+                    if selection_mode == "batch":
+                        fields |= {"jobId", "missing", "changed"}
+                    object_fields(result, fields, fields)
                     require(type(result["count"]) is int and result["count"] == data["count"]
-                            and result["selectionMode"] == json.loads(row["payload"])["selection"]["mode"], "删除预览无效")
+                            and result["selectionMode"] == selection_mode, "删除预览无效")
+                    if selection_mode == "batch":
+                        require(result["jobId"] == selection["jobId"], "删除预览批次不符")
+                        require(integer(result["missing"], 0, 100000) and integer(result["changed"], 0, 100000)
+                                and result["count"] + result["missing"] + result["changed"] <= 100000,
+                                "批次跳过数量无效")
                     validate_rows(result["preview"], 10)
                     require(len(result["preview"]) <= data["count"], "预览超过目标数量")
-            if row["action"] == "list" and target == "completed" or target == "ready":
+            if row["action"] in ("list", "batches") and target == "completed" or target == "ready":
                 require(result is not None, "必须包含预览结果")
             if row["action"] == "delete" and row["result"] is not None and result is not None:
                 require(canonical(result) == row["result"], "已确认的删除预览不能改变", 409)

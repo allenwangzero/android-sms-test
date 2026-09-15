@@ -7,6 +7,7 @@ import android.content.pm.PackageManager;
 import android.database.Cursor;
 import android.database.sqlite.SQLiteDatabase;
 import android.database.sqlite.SQLiteOpenHelper;
+import android.net.Uri;
 import android.provider.Telephony;
 import java.io.IOException;
 import java.util.ArrayList;
@@ -40,6 +41,98 @@ public final class SmsRepository {
         this.active = active;
     }
 
+    /** A batch exists before its first provider insertion, including failed/empty attempts. */
+    public synchronized void beginImport(String scope, String jobId, int requested) throws Exception {
+        validateKey(scope, jobId);
+        requireRead();
+        requireDefault();
+        if (requested < 1 || requested > 100000) throw new IOException("导入批次数量无效");
+        ContentValues values = new ContentValues();
+        values.put("scope", scope); values.put("job_id", jobId);
+        values.put("created_at", System.currentTimeMillis()); values.put("requested", requested);
+        values.put("status", "writing"); values.put("recorded", 0);
+        helper.getWritableDatabase().insertOrThrow("import_batches", null, values);
+    }
+
+    /** Only the provider-returned ID establishes ownership; never infer it from message contents. */
+    public synchronized void recordInserted(String scope, String jobId, int position, Uri inserted) throws Exception {
+        validateKey(scope, jobId);
+        requireRead();
+        requireDefault();
+        if (inserted == null || !"content".equals(inserted.getScheme())
+                || !"sms".equals(inserted.getAuthority()) || inserted.getLastPathSegment() == null
+                || !inserted.getLastPathSegment().matches("[1-9][0-9]*") || position < 1) {
+            throw new IOException("短信已写入但系统返回的记录标识无效，已停止；此条无法按批次清理");
+        }
+        String[] raw;
+        try (Cursor cursor = context.getContentResolver().query(Telephony.Sms.CONTENT_URI, COLUMNS,
+                "_id=?", new String[] {inserted.getLastPathSegment()}, null)) {
+            if (cursor == null || !cursor.moveToFirst()) {
+                throw new IOException("短信已写入但无法回读记录，已停止；此条无法按批次清理");
+            }
+            raw = read(cursor);
+            if (!inserted.getLastPathSegment().equals(raw[0]) || cursor.moveToNext()) {
+                throw new IOException("短信已写入但回读标识不匹配，已停止");
+            }
+        }
+        SQLiteDatabase db = helper.getWritableDatabase();
+        db.beginTransaction();
+        try {
+            try (Cursor batch = db.rawQuery("SELECT requested,status,recorded FROM import_batches WHERE scope=? AND job_id=?",
+                    new String[] {scope, jobId})) {
+                if (!batch.moveToFirst() || !"writing".equals(batch.getString(1))
+                        || batch.getInt(2) != position - 1 || position > batch.getInt(0)) {
+                    throw new IOException("短信已写入但批次记录顺序异常，已停止");
+                }
+            }
+            ContentValues values = new ContentValues();
+            values.put("scope", scope); values.put("job_id", jobId); values.put("position", position);
+            values.put("sms_id", raw[0]); values.put("raw", encode(raw));
+            values.put("fingerprint", SmsFingerprint.of(raw));
+            db.insertOrThrow("import_items", null, values);
+            ContentValues progress = new ContentValues(); progress.put("recorded", position);
+            if (db.update("import_batches", progress, "scope=? AND job_id=? AND recorded=? AND status='writing'",
+                    new String[] {scope, jobId, Integer.toString(position - 1)}) != 1) {
+                throw new IOException("导入批次记录计数保存失败，已停止");
+            }
+            db.setTransactionSuccessful();
+        } finally { db.endTransaction(); }
+    }
+
+    public synchronized void finishImport(String scope, String jobId, String status) throws Exception {
+        validateKey(scope, jobId);
+        if (!"completed".equals(status) && !"failed".equals(status)) throw new IOException("导入批次状态无效");
+        ContentValues values = new ContentValues(); values.put("status", status);
+        // No row is possible when the initial ledger write failed, before beginImport was called.
+        helper.getWritableDatabase().update("import_batches", values, "scope=? AND job_id=? AND status='writing'",
+                new String[] {scope, jobId});
+    }
+
+    public synchronized void recoverImports() {
+        ContentValues values = new ContentValues(); values.put("status", "interrupted");
+        helper.getWritableDatabase().update("import_batches", values, "status='writing'", null);
+    }
+
+    public synchronized JSONObject listBatches(String scope, int page) throws Exception {
+        validateKey(scope, scope);
+        if (page < 0 || page > 10000000) throw new IOException("导入批次页码无效");
+        SQLiteDatabase db = helper.getReadableDatabase();
+        int total;
+        try (Cursor cursor = db.rawQuery("SELECT COUNT(*) FROM import_batches WHERE scope=?", new String[] {scope})) {
+            if (!cursor.moveToFirst()) throw new IOException("无法读取导入批次总数");
+            total = cursor.getInt(0);
+        }
+        JSONArray batches = new JSONArray();
+        try (Cursor cursor = db.rawQuery("SELECT job_id,created_at,requested,status,recorded FROM import_batches WHERE scope=? ORDER BY created_at DESC,job_id DESC LIMIT ? OFFSET ?",
+                new String[] {scope, Integer.toString(PAGE_SIZE), Long.toString((long) page * PAGE_SIZE)})) {
+            while (cursor.moveToNext()) {
+                batches.put(new JSONObject().put("jobId", cursor.getString(0)).put("createdAt", cursor.getLong(1))
+                        .put("requested", cursor.getInt(2)).put("status", cursor.getString(3)).put("recorded", cursor.getInt(4)));
+            }
+        }
+        return new JSONObject().put("total", total).put("page", page).put("pageSize", PAGE_SIZE).put("batches", batches);
+    }
+
     public synchronized JSONObject list(JSONObject filters, int page) throws Exception {
         requireRead();
         active.check();
@@ -65,12 +158,14 @@ public final class SmsRepository {
         active.check();
         validateKey(scope, requestId);
         String mode = selection.getString("mode");
-        if (!mode.equals("selected") && !mode.equals("filtered") && !mode.equals("all")) {
+        if (!mode.equals("selected") && !mode.equals("filtered") && !mode.equals("all") && !mode.equals("batch")) {
             throw new IOException("删除选择方式无效");
         }
         // Non-default apps can receive the provider's restricted inbox/sent view.
-        if (mode.equals("all")) requireDefault();
-        Query query = mode.equals("all") ? new Query() : filters(filters);
+        if (mode.equals("all") || mode.equals("batch")) requireDefault();
+        Query query = mode.equals("all") || mode.equals("batch") ? new Query() : filters(filters);
+        String jobId = mode.equals("batch") ? selection.getString("jobId") : "";
+        if (mode.equals("batch")) validateKey(scope, jobId);
         Map<String, String> selected = new HashMap<>();
         if (mode.equals("selected")) {
             JSONArray items = selection.getJSONArray("items");
@@ -83,14 +178,30 @@ public final class SmsRepository {
                         || selected.put(id, fingerprint) != null) throw new IOException("勾选短信标识无效或重复");
             }
         }
+        if (mode.equals("batch")) {
+            SQLiteDatabase history = helper.getReadableDatabase();
+            try (Cursor batch = history.rawQuery("SELECT status FROM import_batches WHERE scope=? AND job_id=?", new String[] {scope, jobId})) {
+                if (!batch.moveToFirst()) throw new IOException("此批次没有手机导入记录；旧版数据不能推断归属");
+                if ("writing".equals(batch.getString(0))) throw new IOException("此批次仍在写入，请完成后再清理");
+            }
+            try (Cursor items = history.rawQuery("SELECT sms_id,fingerprint FROM import_items WHERE scope=? AND job_id=? ORDER BY position", new String[] {scope, jobId})) {
+                while (items.moveToNext()) {
+                    active.check();
+                    if (selected.put(items.getString(0), items.getString(1)) != null) throw new IOException("批次短信标识重复，已停止");
+                }
+            }
+        }
         List<String> signature = new ArrayList<>();
         signature.add(mode);
+        signature.add(jobId);
         signature.add(query.sql());
         signature.addAll(query.args);
         List<String> ids = new ArrayList<>(selected.keySet());
         java.util.Collections.sort(ids);
         for (String id : ids) { signature.add(id); signature.add(selected.get(id)); }
         String requestHash = SmsFingerprint.of(signature.toArray(new String[0]));
+        SmsBatchSelection batchSelection = mode.equals("batch") ? new SmsBatchSelection(selected) : null;
+        if (batchSelection != null) selected.clear();
         SQLiteDatabase db = helper.getWritableDatabase();
         db.beginTransaction();
         try {
@@ -107,6 +218,7 @@ public final class SmsRepository {
             task.put("scope", scope); task.put("request_id", requestId);
             task.put("request_hash", requestHash); task.put("mode", mode);
             task.put("total", 0); task.put("deleted", 0);
+            task.put("missing", 0); task.put("changed", 0); task.put("job_id", jobId);
             db.insertOrThrow("tasks", null, task);
             int count = 0;
             try (Cursor cursor = query(query)) {
@@ -118,6 +230,7 @@ public final class SmsRepository {
                     if (mode.equals("selected") && !fingerprint.equals(selected.remove(raw[0]))) {
                         throw new IOException("勾选短信已发生变化，请刷新列表后重新选择");
                     }
+                    if (batchSelection != null && !batchSelection.matches(raw[0], fingerprint)) continue;
                     ContentValues item = new ContentValues();
                     item.put("scope", scope); item.put("request_id", requestId); item.put("position", count);
                     item.put("raw", encode(raw)); item.put("fingerprint", fingerprint);
@@ -125,8 +238,10 @@ public final class SmsRepository {
                     count++;
                 }
             }
-            if (!selected.isEmpty()) throw new IOException("勾选短信已消失或不再符合筛选条件，请刷新列表");
+            if (mode.equals("selected") && !selected.isEmpty()) throw new IOException("勾选短信已消失或不再符合筛选条件，请刷新列表");
             ContentValues values = new ContentValues(); values.put("total", count);
+            values.put("missing", batchSelection == null ? 0 : batchSelection.missing());
+            values.put("changed", batchSelection == null ? 0 : batchSelection.changed());
             db.update("tasks", values, "scope=? AND request_id=?", new String[] {scope, requestId});
             JSONObject result = describe(db, scope, requestId);
             active.check();
@@ -209,9 +324,12 @@ public final class SmsRepository {
 
     private JSONObject describe(SQLiteDatabase db, String scope, String id) throws Exception {
         JSONObject result = new JSONObject();
-        try (Cursor cursor = db.rawQuery("SELECT total,mode FROM tasks WHERE scope=? AND request_id=?", new String[] {scope, id})) {
+        try (Cursor cursor = db.rawQuery("SELECT total,mode,missing,changed,job_id FROM tasks WHERE scope=? AND request_id=?", new String[] {scope, id})) {
             if (!cursor.moveToFirst()) throw new IOException("删除快照不存在");
             result.put("count", cursor.getInt(0)).put("selectionMode", cursor.getString(1));
+            if ("batch".equals(cursor.getString(1))) {
+                result.put("missing", cursor.getInt(2)).put("changed", cursor.getInt(3)).put("jobId", cursor.getString(4));
+            }
         }
         JSONArray preview = new JSONArray();
         try (Cursor cursor = db.rawQuery("SELECT raw FROM items WHERE scope=? AND request_id=? ORDER BY position LIMIT 10", new String[] {scope, id})) {
@@ -308,13 +426,24 @@ public final class SmsRepository {
         String sql() { return parts.isEmpty() ? "1=1" : String.join(" AND ", parts); }
     }
     private static final class Database extends SQLiteOpenHelper {
-        Database(Context context) { super(context, "sms-management.db", null, 1); }
+        Database(Context context) { super(context, "sms-management.db", null, 2); }
         @Override public void onCreate(SQLiteDatabase db) {
-            db.execSQL("CREATE TABLE tasks(scope TEXT NOT NULL,request_id TEXT NOT NULL,request_hash TEXT NOT NULL,mode TEXT NOT NULL,total INTEGER NOT NULL,deleted INTEGER NOT NULL,PRIMARY KEY(scope,request_id))");
+            db.execSQL("CREATE TABLE tasks(scope TEXT NOT NULL,request_id TEXT NOT NULL,request_hash TEXT NOT NULL,mode TEXT NOT NULL,total INTEGER NOT NULL,deleted INTEGER NOT NULL,missing INTEGER NOT NULL DEFAULT 0,changed INTEGER NOT NULL DEFAULT 0,job_id TEXT NOT NULL DEFAULT '',PRIMARY KEY(scope,request_id))");
             db.execSQL("CREATE TABLE items(scope TEXT NOT NULL,request_id TEXT NOT NULL,position INTEGER NOT NULL,raw TEXT NOT NULL,fingerprint TEXT NOT NULL,PRIMARY KEY(scope,request_id,position))");
+            createImportTables(db);
         }
         @Override public void onUpgrade(SQLiteDatabase db, int oldVersion, int newVersion) {
-            throw new IllegalStateException("不支持删除快照数据库版本迁移");
+            if (oldVersion == 1 && newVersion == 2) {
+                db.execSQL("ALTER TABLE tasks ADD COLUMN missing INTEGER NOT NULL DEFAULT 0");
+                db.execSQL("ALTER TABLE tasks ADD COLUMN changed INTEGER NOT NULL DEFAULT 0");
+                db.execSQL("ALTER TABLE tasks ADD COLUMN job_id TEXT NOT NULL DEFAULT ''");
+                createImportTables(db);
+            } else throw new IllegalStateException("不支持短信管理数据库版本迁移");
+        }
+        private void createImportTables(SQLiteDatabase db) {
+            db.execSQL("CREATE TABLE import_batches(scope TEXT NOT NULL,job_id TEXT NOT NULL,created_at INTEGER NOT NULL,requested INTEGER NOT NULL,status TEXT NOT NULL,recorded INTEGER NOT NULL,PRIMARY KEY(scope,job_id))");
+            db.execSQL("CREATE TABLE import_items(scope TEXT NOT NULL,job_id TEXT NOT NULL,position INTEGER NOT NULL,sms_id TEXT NOT NULL,raw TEXT NOT NULL,fingerprint TEXT NOT NULL,PRIMARY KEY(scope,job_id,position),UNIQUE(scope,job_id,sms_id))");
+            db.execSQL("CREATE INDEX import_batches_created ON import_batches(scope,created_at DESC,job_id DESC)");
         }
     }
 }
