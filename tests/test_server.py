@@ -4,10 +4,11 @@ import tempfile
 import threading
 import unittest
 import uuid
+from unittest.mock import patch
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from desktop.server import ApiError, MAX_BODY, Server, Store
+from desktop.server import ApiError, BATCH_SIZE, MAX_BODY, Server, Store
 
 
 class ServerTests(unittest.TestCase):
@@ -29,7 +30,7 @@ class ServerTests(unittest.TestCase):
 
     def call(self, path, data=None, token=None, headers=None):
         connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=3)
-        request_headers = {"Content-Type": "application/json"}
+        request_headers = {"Content-Type": "application/json", "X-SMS-Protocol": "2"}
         if token:
             request_headers["Authorization"] = "Bearer " + token
         request_headers.update(headers or {})
@@ -54,12 +55,32 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(status, 200)
         return device
 
+    def start_upload(self, devices, count, request_id=None):
+        body = {"requestId": request_id or str(uuid.uuid4()),
+                "deviceIds": [d["deviceId"] for d in devices], "count": count}
+        status, result = self.call("/api/uploads", body, self.admin)
+        self.assertEqual(status, 200)
+        return body, result
+
+    def put_batch(self, upload, index, messages):
+        return self.call(f"/api/uploads/{upload}/batches/{index}", {"messages": messages}, self.admin)
+
+    def commit(self, upload):
+        return self.call(f"/api/uploads/{upload}/commit", {}, self.admin)
+
     def jobs(self, devices):
-        body = {"requestId": str(uuid.uuid4()), "deviceIds": [d["deviceId"] for d in devices],
-                "messages": [{"sender": "TEST", "body": "含空格的测试短信 📨", "timestamp": 123}]}
-        status, result = self.call("/api/jobs", body, self.admin)
+        body, _ = self.start_upload(devices, 1)
+        self.assertEqual(self.put_batch(body["requestId"], 0, [self.message()])[0], 200)
+        status, result = self.commit(body["requestId"])
         self.assertEqual(status, 200)
         return body, result["jobs"]
+
+    @staticmethod
+    def message(index=123):
+        return {"sender": "TEST", "body": "含空格的测试短信 📨", "timestamp": index}
+
+    def get_batch(self, device, job, index):
+        return self.call(f"/api/device/jobs/{job['id']}/batches/{index}", token=device["deviceToken"])
 
     def report(self, device, job, status, written=0, error=""):
         return self.call(f"/api/device/jobs/{job['id']}/status",
@@ -87,22 +108,26 @@ class ServerTests(unittest.TestCase):
         request, jobs = self.jobs(devices)
         self.assertEqual(len(jobs), 2)
         self.assertNotIn("messages", jobs[0])
-        status, retry = self.call("/api/jobs", request, self.admin)
+        status, retry = self.commit(request["requestId"])
         self.assertEqual(status, 200)
         self.assertEqual(retry["jobs"], jobs)
-        request["messages"][0]["body"] = "已修改"
-        self.assertEqual(self.call("/api/jobs", request, self.admin)[0], 409)
-        for device, job in zip(devices, jobs):
+        modified = self.message()
+        modified["body"] = "已修改"
+        self.assertEqual(self.put_batch(request["requestId"], 0, [modified])[0], 409)
+        for device in devices:
+            job = next(job for job in jobs if job["deviceId"] == device["deviceId"])
             pending = self.call("/api/device/jobs", token=device["deviceToken"])[1]["job"]
             self.assertEqual(pending["id"], job["id"])
-            self.assertEqual(pending["messages"][0]["body"], "含空格的测试短信 📨")
+            self.assertEqual(pending["preview"][0]["body"], "含空格的测试短信 📨")
         reopened = Store(self.db_path, self.store.server_url)
         try:
             self.assertEqual(reopened.admin_token, self.admin)
             self.assertEqual(len(reopened.state()["jobs"]), 2)
-            self.assertEqual(reopened.pending(devices[0]["deviceToken"])["job"]["id"], jobs[0]["id"])
-            request["messages"][0]["body"] = "含空格的测试短信 📨"
-            self.assertEqual(reopened.create_jobs(request)["jobs"], jobs)
+            self.assertEqual(reopened.pending(devices[0]["deviceToken"])["job"]["deviceId"], devices[0]["deviceId"])
+            self.assertEqual(reopened.commit_upload(request["requestId"])["jobs"], jobs)
+            self.assertEqual(reopened.create_upload(request)["jobs"], jobs)
+            rows = reopened.db.execute("SELECT messages, upload_id FROM jobs").fetchall()
+            self.assertTrue(all(row["messages"] == "[]" and row["upload_id"] == request["requestId"] for row in rows))
         finally:
             reopened.db.close()
 
@@ -159,35 +184,161 @@ class ServerTests(unittest.TestCase):
 
     def test_validation(self):
         device = self.device()
-        request, _ = self.jobs([device])
-        request["requestId"] = str(uuid.uuid4())
+        request, _ = self.start_upload([device], 1)
         for value in [True, -1, 4102444800001, "123"]:
-            request["messages"][0]["timestamp"] = value
-            self.assertEqual(self.call("/api/jobs", request, self.admin)[0], 400)
-        request["messages"][0]["timestamp"] = 123
-        request["messages"][0]["sender"] = " "
-        self.assertEqual(self.call("/api/jobs", request, self.admin)[0], 400)
-        self.assertEqual(self.call("/api/jobs", {}, self.admin,
+            message = self.message(value)
+            self.assertEqual(self.put_batch(request["requestId"], 0, [message])[0], 400)
+        message = self.message()
+        message["sender"] = " "
+        self.assertEqual(self.put_batch(request["requestId"], 0, [message])[0], 400)
+        message["sender"] = "\ud800"
+        self.assertEqual(self.put_batch(request["requestId"], 0, [message])[0], 400)
+        for count in [0, 100001, True, "1"]:
+            invalid = dict(request, requestId=str(uuid.uuid4()), count=count)
+            self.assertEqual(self.call("/api/uploads", invalid, self.admin)[0], 400)
+        self.assertEqual(self.call("/api/uploads", {}, self.admin,
                                    {"Content-Length": str(MAX_BODY + 1)})[0], 413)
 
-    def test_large_batch_response_and_snapshot_limit(self):
+    def test_large_ordered_batches_and_protocol(self):
+        device, other = self.device(), self.device()
+        count = 10001
+        request, created = self.start_upload([device], count)
+        upload_id = request["requestId"]
+        self.assertEqual(created["batchCount"], 21)
+        self.assertEqual(created["jobs"], [])
+        self.assertEqual(self.commit(upload_id)[0], 409)
+        for index in range(21):
+            messages = [self.message(i) for i in range(index * BATCH_SIZE, min((index + 1) * BATCH_SIZE, count))]
+            self.assertEqual(self.put_batch(upload_id, index, messages)[0], 200)
+        self.assertIsNone(self.call("/api/device/jobs", token=device["deviceToken"])[1]["job"])
+        status, result = self.commit(upload_id)
+        self.assertEqual(status, 200)
+        job = result["jobs"][0]
+        pending = self.call("/api/device/jobs", token=device["deviceToken"])[1]["job"]
+        self.assertNotIn("messages", pending)
+        self.assertEqual(len(pending["preview"]), 20)
+        self.assertEqual(self.get_batch(device, job, 0)[0], 409)
+        self.assertEqual(self.get_batch(other, job, 0)[0], 404)
+        self.assertEqual(self.call("/api/device/jobs", token=device["deviceToken"],
+                                   headers={"X-SMS-Protocol": "1"})[0], 426)
+        self.assertEqual(self.report(device, job, "received")[0], 200)
+        self.assertEqual(self.report(device, job, "writing")[0], 200)
+        collected = []
+        for index in range(21):
+            if index < 20:
+                self.assertEqual(self.get_batch(device, job, index + 1)[0], 409)
+            status, batch = self.get_batch(device, job, index)
+            self.assertEqual(status, 200)
+            self.assertEqual(batch["offset"], len(collected))
+            self.assertEqual(batch["total"], count)
+            collected.extend(message["timestamp"] for message in batch["messages"])
+            self.assertEqual(self.report(device, job, "writing", len(collected))[0], 200)
+        self.assertEqual(collected, list(range(count)))
+        self.assertEqual(self.report(device, job, "completed", count)[0], 200)
+        self.assertEqual(self.get_batch(device, job, 20)[0], 409)
+
+    def test_partial_upload_restart_conflicts_and_size_limit(self):
         device = self.device()
-        data = {"requestId": str(uuid.uuid4()), "deviceIds": [device["deviceId"]],
-                "messages": [{"sender": "TEST", "body": "a" * 3945, "timestamp": 123}] * 4200}
-        self.store.create_jobs(data)
-        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=5)
-        connection.request("GET", "/api/device/jobs", headers={"Authorization": "Bearer " + device["deviceToken"]})
-        response = connection.getresponse()
-        raw = response.read()
-        self.assertEqual(response.status, 200)
-        self.assertLessEqual(len(raw), MAX_BODY)
-        self.assertEqual(len(json.loads(raw)["job"]["messages"]), 4200)
-        connection.close()
-        data["requestId"] = str(uuid.uuid4())
-        data["messages"] = [{"sender": "TEST", "body": "a" * 4000, "timestamp": 123}] * 4200
-        with self.assertRaises(ApiError) as caught:
-            self.store.create_jobs(data)
-        self.assertEqual(caught.exception.status, 413)
+        request, _ = self.start_upload([device], 501)
+        upload = request["requestId"]
+        messages = [self.message(i) for i in range(500)]
+        self.assertEqual(self.put_batch(upload, 0, messages)[0], 200)
+        self.assertEqual(self.put_batch(upload, 0, messages)[0], 200)
+        self.assertEqual(self.put_batch(upload, 1, messages)[0], 400)
+        for index in [-1, 2, "abc"]:
+            self.assertEqual(self.put_batch(upload, index, [self.message()])[0], 400)
+        self.assertEqual(self.call("/api/uploads", dict(request, count=500), self.admin)[0], 409)
+        self.assertEqual(self.put_batch(str(uuid.uuid4()), 0, [self.message()])[0], 404)
+        reopened = Store(self.db_path, self.store.server_url)
+        try:
+            resumed = reopened.create_upload(request)
+            self.assertEqual(resumed["receivedBatches"], [0])
+            self.assertIsNone(reopened.pending(device["deviceToken"])["job"])
+            reopened.upload_batch(upload, 1, {"messages": [self.message(500)]})
+            jobs = reopened.commit_upload(upload)["jobs"]
+            self.assertEqual(reopened.commit_upload(upload)["jobs"], jobs)
+            bytes_stored = reopened.db.execute("SELECT byte_count FROM uploads WHERE id=?", (upload,)).fetchone()[0] + 1
+            _, exact_size = Store.validate_messages(messages + [self.message(500)])
+            self.assertEqual(bytes_stored, exact_size)
+        finally:
+            reopened.db.close()
+        request, _ = self.start_upload([device], 501)
+        _, first_size = Store.validate_messages(messages)
+        with patch("desktop.server.MAX_SNAPSHOT", first_size):
+            self.assertEqual(self.put_batch(request["requestId"], 0, messages)[0], 200)
+            self.assertEqual(self.put_batch(request["requestId"], 1, [self.message()])[0], 413)
+            self.assertEqual(self.commit(request["requestId"])[0], 409)
+
+    def test_cancel_upload_and_commit_race(self):
+        device = self.device()
+        for _ in range(5):
+            request, _ = self.start_upload([device], 1)
+            upload = request["requestId"]
+            self.assertEqual(self.put_batch(upload, 0, [self.message()])[0], 200)
+            gate = threading.Barrier(2)
+            results = {}
+
+            def run(name, operation):
+                gate.wait()
+                try:
+                    operation(upload)
+                    results[name] = 200
+                except ApiError as exc:
+                    results[name] = exc.status
+
+            threads = [threading.Thread(target=run, args=("cancel", self.store.cancel_upload)),
+                       threading.Thread(target=run, args=("commit", self.store.commit_upload))]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            self.assertIn(results, [{"cancel": 200, "commit": 410}, {"cancel": 409, "commit": 200}])
+            if results["cancel"] == 200:
+                self.assertEqual(self.store.db.execute("SELECT COUNT(*) FROM upload_batches WHERE upload_id=?", (upload,)).fetchone()[0], 0)
+                self.assertEqual(self.call(f"/api/uploads/{upload}/cancel", {}, self.admin)[0], 200)
+            else:
+                self.assertEqual(self.call(f"/api/uploads/{upload}/cancel", {}, self.admin)[0], 409)
+                self.assertEqual(len(self.store.commit_upload(upload)["jobs"]), 1)
+        self.assertEqual(self.call(f"/api/uploads/{uuid.uuid4()}/cancel", {}, device["deviceToken"])[0], 401)
+
+    def test_cancel_tombstone_blocks_delayed_start_and_survives_restart(self):
+        device = self.device()
+        for already_started in [False, True]:
+            request = {"requestId": str(uuid.uuid4()), "deviceIds": [device["deviceId"]], "count": 1}
+            upload = request["requestId"]
+            if already_started:
+                self.assertEqual(self.call("/api/uploads", request, self.admin)[0], 200)
+                self.assertEqual(self.put_batch(upload, 0, [self.message()])[0], 200)
+            self.assertEqual(self.call(f"/api/uploads/{upload}/cancel", {}, self.admin)[0], 200)
+            self.assertEqual(self.call(f"/api/uploads/{upload}/cancel", {}, self.admin)[0], 200)
+            self.assertEqual(self.call("/api/uploads", request, self.admin)[0], 410)
+            self.assertEqual(self.put_batch(upload, 0, [self.message()])[0], 410)
+            self.assertEqual(self.commit(upload)[0], 410)
+            reopened = Store(self.db_path, self.store.server_url)
+            try:
+                for operation in [lambda: reopened.create_upload(request),
+                                  lambda: reopened.upload_batch(upload, 0, {"messages": [self.message()]}),
+                                  lambda: reopened.commit_upload(upload)]:
+                    with self.assertRaises(ApiError) as caught:
+                        operation()
+                    self.assertEqual(caught.exception.status, 410)
+                self.assertEqual(reopened.state()["jobs"], [])
+                self.assertEqual(reopened.cancel_upload(upload), {"ok": True})
+            finally:
+                reopened.db.close()
+        self.assertEqual(self.call("/api/uploads/not-a-uuid/cancel", {}, self.admin)[0], 400)
+
+    def test_existing_database_jobs_are_preserved(self):
+        device = self.device()
+        job_id = str(uuid.uuid4())
+        with self.store.lock, self.store.db:
+            self.store.db.execute("INSERT INTO jobs (id,device_id,status,count,written,error,created_at,updated_at,messages) "
+                                  "VALUES (?,?,'received',501,0,'',1,1,?)",
+                                  (job_id, device["deviceId"], json.dumps([self.message(i) for i in range(501)])))
+        job = {"id": job_id}
+        self.assertEqual(len(self.get_batch(device, job, 0)[1]["messages"]), 500)
+        self.assertEqual(self.report(device, job, "writing", 500)[0], 200)
+        self.assertEqual(self.get_batch(device, job, 1)[1]["messages"][0]["timestamp"], 500)
 
 
 if __name__ == "__main__":

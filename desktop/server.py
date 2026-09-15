@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """可信局域网短信测试服务；仅使用 SQLite 保存状态，不记录请求内容。"""
 import argparse
-import hashlib
 import hmac
 import io
 import ipaddress
@@ -17,6 +16,9 @@ from pathlib import Path
 from urllib.parse import urlencode, urlsplit
 
 MAX_BODY = 16 * 1024 * 1024
+MAX_COUNT = 100000
+BATCH_SIZE = 500
+MAX_SNAPSHOT = 256 * 1024 * 1024
 TERMINAL = {"completed", "failed", "interrupted"}
 TRANSITIONS = {
     "queued": {"received"},
@@ -67,14 +69,24 @@ class Store:
             CREATE TABLE IF NOT EXISTS devices (
                 id TEXT PRIMARY KEY, client_id TEXT UNIQUE NOT NULL,
                 token TEXT UNIQUE NOT NULL, name TEXT NOT NULL, last_seen INTEGER NOT NULL);
-            CREATE TABLE IF NOT EXISTS requests (
-                id TEXT PRIMARY KEY, digest TEXT NOT NULL, job_ids TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS jobs (
                 id TEXT PRIMARY KEY, device_id TEXT NOT NULL, status TEXT NOT NULL,
                 count INTEGER NOT NULL, written INTEGER NOT NULL, error TEXT NOT NULL,
                 created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, messages TEXT NOT NULL);
         """)
+        self.db.executescript("""
+            CREATE TABLE IF NOT EXISTS cancelled_uploads (id TEXT PRIMARY KEY);
+            CREATE TABLE IF NOT EXISTS uploads (
+                id TEXT PRIMARY KEY, device_ids TEXT NOT NULL, count INTEGER NOT NULL,
+                byte_count INTEGER NOT NULL DEFAULT 0, job_ids TEXT NOT NULL DEFAULT '[]');
+            CREATE TABLE IF NOT EXISTS upload_batches (
+                upload_id TEXT NOT NULL, batch_index INTEGER NOT NULL, messages TEXT NOT NULL,
+                PRIMARY KEY (upload_id, batch_index));
+        """)
         with self.lock, self.db:
+            columns = {row["name"] for row in self.db.execute("PRAGMA table_info(jobs)")}
+            if "upload_id" not in columns:
+                self.db.execute("ALTER TABLE jobs ADD COLUMN upload_id TEXT")
             if not self.setting("admin_token"):
                 self.set_setting("admin_token", secrets.token_urlsafe(32))
             self.admin_token = self.setting("admin_token")
@@ -122,13 +134,21 @@ class Store:
         require(row is not None, "设备认证失败", 401)
         return row["id"]
 
-    @staticmethod
-    def job(row, messages=False):
+    def batch_messages(self, row, index):
+        if row["upload_id"]:
+            batch = self.db.execute("SELECT messages FROM upload_batches WHERE upload_id=? AND batch_index=?",
+                                    (row["upload_id"], index)).fetchone()
+            require(batch is not None, "短信分批数据不存在", 500)
+            return json.loads(batch["messages"])
+        return json.loads(row["messages"])[index * BATCH_SIZE:(index + 1) * BATCH_SIZE]
+
+    def job(self, row, preview=False):
         result = {"id": row["id"], "deviceId": row["device_id"], "status": row["status"],
                   "count": row["count"], "written": row["written"], "error": row["error"],
-                  "createdAt": row["created_at"], "updatedAt": row["updated_at"]}
-        if messages:
-            result["messages"] = json.loads(row["messages"])
+                  "createdAt": row["created_at"], "updatedAt": row["updated_at"],
+                  "batchSize": BATCH_SIZE, "batchCount": (row["count"] + BATCH_SIZE - 1) // BATCH_SIZE}
+        if preview:
+            result["preview"] = self.batch_messages(row, 0)[:20]
         return result
 
     def state(self):
@@ -138,13 +158,45 @@ class Store:
             jobs = [self.job(row) for row in self.db.execute("SELECT * FROM jobs ORDER BY rowid DESC")]
             return {"devices": devices, "jobs": jobs}
 
-    def create_jobs(self, data):
-        request_id, device_ids, messages = data.get("requestId"), data.get("deviceIds"), data.get("messages")
+    def upload_result(self, row):
+        ids = json.loads(row["job_ids"])
+        return {"uploadId": row["id"], "count": row["count"], "batchSize": BATCH_SIZE,
+                "batchCount": (row["count"] + BATCH_SIZE - 1) // BATCH_SIZE,
+                "receivedBatches": [batch[0] for batch in self.db.execute(
+                    "SELECT batch_index FROM upload_batches WHERE upload_id=? ORDER BY batch_index", (row["id"],))],
+                "jobs": [self.job(self.db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone())
+                         for job_id in ids]}
+
+    def require_active_upload(self, upload_id):
+        require(not self.db.execute("SELECT 1 FROM cancelled_uploads WHERE id=?", (upload_id,)).fetchone(),
+                "上传已经取消，请创建新的发送任务", 410)
+
+    def create_upload(self, data):
+        request_id, device_ids, count = data.get("requestId"), data.get("deviceIds"), data.get("count")
         require(is_uuid(request_id), "requestId 必须为 UUID")
         require(isinstance(device_ids, list) and 1 <= len(device_ids) <= 1000
                 and all(is_uuid(value) for value in device_ids), "请选择有效设备")
         require(len(set(device_ids)) == len(device_ids), "设备不能重复")
-        require(isinstance(messages, list) and 1 <= len(messages) <= 10000, "每批须为 1–10000 条短信")
+        require(type(count) is int and 1 <= count <= MAX_COUNT, "每个任务须为 1–100000 条短信")
+        canonical_devices = json.dumps(sorted(device_ids))
+        with self.lock, self.db:
+            self.require_active_upload(request_id)
+            row = self.db.execute("SELECT * FROM uploads WHERE id=?", (request_id,)).fetchone()
+            if row:
+                require(row["device_ids"] == canonical_devices and row["count"] == count,
+                        "requestId 已用于其他设备或短信数量", 409)
+            else:
+                for device_id in device_ids:
+                    require(self.db.execute("SELECT 1 FROM devices WHERE id=?", (device_id,)).fetchone(),
+                            "设备不存在", 404)
+                self.db.execute("INSERT INTO uploads (id, device_ids, count) VALUES (?, ?, ?)",
+                                (request_id, canonical_devices, count))
+                row = self.db.execute("SELECT * FROM uploads WHERE id=?", (request_id,)).fetchone()
+            return self.upload_result(row)
+
+    @staticmethod
+    def validate_messages(messages):
+        require(isinstance(messages, list), "短信须为数组")
         for message in messages:
             require(isinstance(message, dict), "短信格式错误")
             require(set(message) == {"sender", "body", "timestamp"}, "短信字段必须为 sender/body/timestamp")
@@ -152,30 +204,76 @@ class Store:
             require(text_field(message["body"], 4000), "内容须为 1–4000 个字符")
             require(type(message["timestamp"]) is int and 0 <= message["timestamp"] <= 4102444800000,
                     "短信时间须为有效毫秒整数")
-        snapshot = json.dumps(messages, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        require(len(snapshot.encode("utf-8")) <= MAX_BODY - 4096,
-                "短信数据过大，请减少数量（需为传输任务信息预留 4 KiB）", 413)
-        canonical = json.dumps({"deviceIds": sorted(device_ids), "messages": messages},
-                               ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        digest = hashlib.sha256(canonical.encode()).hexdigest()
+        try:
+            snapshot = json.dumps(messages, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            size = len(snapshot.encode("utf-8"))
+        except UnicodeEncodeError:
+            raise ApiError(400, "短信包含无效 Unicode 字符") from None
+        return snapshot, size
+
+    def upload_batch(self, upload_id, index, data):
+        messages = data.get("messages")
+        snapshot, size = self.validate_messages(messages)
         with self.lock, self.db:
-            prior = self.db.execute("SELECT * FROM requests WHERE id=?", (request_id,)).fetchone()
+            self.require_active_upload(upload_id)
+            row = self.db.execute("SELECT * FROM uploads WHERE id=?", (upload_id,)).fetchone()
+            require(row is not None, "上传任务不存在", 404)
+            require(0 <= index < (row["count"] + BATCH_SIZE - 1) // BATCH_SIZE, "分批索引越界")
+            require(len(messages) == min(BATCH_SIZE, row["count"] - index * BATCH_SIZE), "分批短信数量不符")
+            prior = self.db.execute("SELECT messages FROM upload_batches WHERE upload_id=? AND batch_index=?",
+                                    (upload_id, index)).fetchone()
             if prior:
-                require(prior["digest"] == digest, "requestId 已用于其他数据", 409)
-                ids = json.loads(prior["job_ids"])
+                require(prior["messages"] == snapshot, "此分批已上传不同内容", 409)
             else:
-                for device_id in device_ids:
-                    require(self.db.execute("SELECT 1 FROM devices WHERE id=?", (device_id,)).fetchone(),
-                            "设备不存在", 404)
-                ids = []
-                for device_id in device_ids:
+                require(row["job_ids"] == "[]", "任务已提交，不能再修改", 409)
+                # Count the canonical full array: two brackets + records + separators.
+                total_bytes = row["byte_count"] + size - 1
+                require(total_bytes + 1 <= MAX_SNAPSHOT, "完整短信列表超过 256 MiB", 413)
+                self.db.execute("INSERT INTO upload_batches VALUES (?, ?, ?)", (upload_id, index, snapshot))
+                self.db.execute("UPDATE uploads SET byte_count=? WHERE id=?", (total_bytes, upload_id))
+            return {"ok": True, "uploadId": upload_id, "index": index}
+
+    def commit_upload(self, upload_id):
+        with self.lock, self.db:
+            self.require_active_upload(upload_id)
+            row = self.db.execute("SELECT * FROM uploads WHERE id=?", (upload_id,)).fetchone()
+            require(row is not None, "上传任务不存在", 404)
+            ids = json.loads(row["job_ids"])
+            if not ids:
+                received = self.db.execute("SELECT COUNT(*) FROM upload_batches WHERE upload_id=?", (upload_id,)).fetchone()[0]
+                require(received == (row["count"] + BATCH_SIZE - 1) // BATCH_SIZE, "短信尚未全部上传", 409)
+                for device_id in json.loads(row["device_ids"]):
                     job_id, timestamp = str(uuid.uuid4()), now()
-                    self.db.execute("INSERT INTO jobs VALUES (?, ?, 'queued', ?, 0, '', ?, ?, ?)",
-                                    (job_id, device_id, len(messages), timestamp, timestamp, snapshot))
+                    self.db.execute("INSERT INTO jobs (id, device_id, status, count, written, error, created_at, updated_at, messages, upload_id) "
+                                    "VALUES (?, ?, 'queued', ?, 0, '', ?, ?, '[]', ?)",
+                                    (job_id, device_id, row["count"], timestamp, timestamp, upload_id))
                     ids.append(job_id)
-                self.db.execute("INSERT INTO requests VALUES (?, ?, ?)", (request_id, digest, json.dumps(ids)))
+                self.db.execute("UPDATE uploads SET job_ids=? WHERE id=?", (json.dumps(ids), upload_id))
             return {"jobs": [self.job(self.db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone())
                              for job_id in ids]}
+
+    def cancel_upload(self, upload_id):
+        require(is_uuid(upload_id), "uploadId 必须为 UUID")
+        with self.lock, self.db:
+            row = self.db.execute("SELECT job_ids FROM uploads WHERE id=?", (upload_id,)).fetchone()
+            if row:
+                require(row["job_ids"] == "[]", "任务已提交，不能取消上传", 409)
+                self.db.execute("DELETE FROM upload_batches WHERE upload_id=?", (upload_id,))
+                self.db.execute("DELETE FROM uploads WHERE id=?", (upload_id,))
+            self.db.execute("INSERT OR IGNORE INTO cancelled_uploads VALUES (?)", (upload_id,))
+            return {"ok": True}
+
+    def device_batch(self, token, job_id, index):
+        with self.lock, self.db:
+            device_id = self.device(token)
+            row = self.db.execute("SELECT * FROM jobs WHERE id=? AND device_id=?", (job_id, device_id)).fetchone()
+            require(row is not None, "任务不存在", 404)
+            require(0 <= index < (row["count"] + BATCH_SIZE - 1) // BATCH_SIZE, "分批索引越界")
+            require(row["status"] in {"received", "writing"}, "任务尚未接收或已经结束", 409)
+            require(index * BATCH_SIZE == row["written"], "须先反馈上一分批完整进度", 409)
+            self.db.execute("UPDATE devices SET last_seen=? WHERE id=?", (now(), device_id))
+            return {"jobId": job_id, "index": index, "offset": index * BATCH_SIZE,
+                    "total": row["count"], "messages": self.batch_messages(row, index)}
 
     def pending(self, token):
         with self.lock, self.db:
@@ -234,7 +332,7 @@ class Server(ThreadingHTTPServer):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "SmsTest/1"
+    server_version = "SmsTest/2"
 
     def log_message(self, format_string, *args):
         pass  # 配对码、设备令牌和短信正文均不记录。
@@ -284,6 +382,14 @@ class Handler(BaseHTTPRequestHandler):
         store = self.server.store
         if path.startswith("/api/") and path != "/api/pair" and not path.startswith("/api/device/"):
             store.admin(self.token())
+        if path.startswith("/api/device/"):
+            with store.lock:
+                store.device(self.token())
+            require(self.headers.get("X-SMS-Protocol") == "2", "请升级安卓工具至支持分批导入的版本", 426)
+        parts = path.split("/")
+        if method == "GET" and len(parts) == 7 and parts[1:4] == ["api", "device", "jobs"] and parts[5] == "batches":
+            require(parts[6].isdigit() and len(parts[6]) <= 6, "分批索引无效")
+            return self.send(200, store.device_batch(self.token(), parts[4], int(parts[6])))
         if method == "GET" and path == "/api/state":
             return self.send(200, store.state())
         if method == "GET" and path in {"/api/pairing", "/api/pairing/qr"}:
@@ -298,17 +404,20 @@ class Handler(BaseHTTPRequestHandler):
         if method == "GET" and path == "/api/device/jobs":
             return self.send(200, store.pending(self.token()))
         if method == "POST":
-            if path.startswith("/api/device/"):
-                with store.lock:
-                    store.device(self.token())
             data = self.body()
             if path == "/api/pairing/rotate":
                 return self.send(200, store.pairing(True))
             if path == "/api/pair":
                 return self.send(200, store.pair(data))
-            if path == "/api/jobs":
-                return self.send(200, store.create_jobs(data))
-            parts = path.split("/")
+            if path == "/api/uploads":
+                return self.send(200, store.create_upload(data))
+            if len(parts) == 6 and parts[1:3] == ["api", "uploads"] and parts[4] == "batches":
+                require(parts[5].isdigit() and len(parts[5]) <= 6, "分批索引无效")
+                return self.send(200, store.upload_batch(parts[3], int(parts[5]), data))
+            if len(parts) == 5 and parts[1:3] == ["api", "uploads"] and parts[4] == "cancel":
+                return self.send(200, store.cancel_upload(parts[3]))
+            if len(parts) == 5 and parts[1:3] == ["api", "uploads"] and parts[4] == "commit":
+                return self.send(200, store.commit_upload(parts[3]))
             if len(parts) == 6 and parts[1:4] == ["api", "device", "jobs"] and parts[5] == "status":
                 return self.send(200, store.update(self.token(), parts[4], data))
         if method == "GET" and path in STATIC:

@@ -4,7 +4,9 @@ const $ = (id) => document.getElementById(id);
 const DRAFT_KEY = 'sms-test-draft-v1';
 const TOKEN_KEY = 'sms-test-admin-token';
 const PAGE_SIZE = 50;
-const MAX_COUNT = 10000;
+const MAX_COUNT = 100000;
+const BATCH_SIZE = 500;
+const MAX_TASK_BYTES = 256 * 1024 * 1024;
 let token = '';
 let messages = [];
 let devices = [];
@@ -13,6 +15,10 @@ let selected = new Set();
 let page = 0;
 let connected = false;
 let sending = false;
+let preparing = false;
+let generating = false;
+let draftRevision = 0;
+let draftLoaded = false;
 let retryPayload = null;
 let pairingExpiry = 0;
 let pairingUrl = '';
@@ -25,8 +31,11 @@ function pendingScope() { return `${location.origin}|${token}`; }
 
 async function openPendingStorage() {
   pendingDatabase = await new Promise((resolve, reject) => {
-    const request = indexedDB.open('sms-test-pending-v1', 1);
-    request.onupgradeneeded = () => request.result.createObjectStore('pending');
+    const request = indexedDB.open('sms-test-pending-v1', 2);
+    request.onupgradeneeded = () => {
+      if (!request.result.objectStoreNames.contains('pending')) request.result.createObjectStore('pending');
+      if (!request.result.objectStoreNames.contains('drafts')) request.result.createObjectStore('drafts');
+    };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error);
     request.onblocked = () => reject(new Error('其他页面阻止了本地存储升级，请关闭其他工作台页面后刷新'));
@@ -52,6 +61,9 @@ function pendingOperation(action, payload = null) {
       if (action === 'claim' && !result) {
         store.put(payload, pendingScope());
         result = payload;
+      } else if (action === 'markAttempted' && result && result.requestId === payload.requestId) {
+        result.uploadAttempted = true;
+        store.put(result, pendingScope());
       } else if (action === 'clear' && result && result.requestId === payload.requestId) {
         store.delete(pendingScope());
         result = null;
@@ -114,31 +126,56 @@ async function api(path, options = {}) {
   return response;
 }
 
-function loadDraft() {
+function draftOperation(action, value = null) {
+  return new Promise((resolve, reject) => {
+    if (!pendingDatabase) { reject(new Error('本地草稿存储不可用')); return; }
+    const transaction = pendingDatabase.transaction('drafts', action === 'read' ? 'readonly' : 'readwrite');
+    const store = transaction.objectStore('drafts');
+    const request = action === 'read' ? store.get(location.origin) : store.put(value, location.origin);
+    transaction.oncomplete = () => resolve(request.result);
+    transaction.onabort = () => reject(transaction.error || new Error('本地草稿保存失败'));
+    transaction.onerror = () => reject(transaction.error || new Error('本地草稿保存失败'));
+  });
+}
+
+async function loadDraft() {
   try {
-    const stored = JSON.parse(localStorage.getItem(DRAFT_KEY) || '[]');
+    let stored = await draftOperation('read');
+    const migrate = stored === undefined;
+    if (migrate) stored = JSON.parse(localStorage.getItem(DRAFT_KEY) || '[]');
     if (!Array.isArray(stored) || stored.length > MAX_COUNT || stored.some(item =>
       !item || typeof item.sender !== 'string' || typeof item.body !== 'string' ||
-      item.sender.length > 100 || item.body.length > 4000 ||
+      [...item.sender].length > 100 || [...item.body].length > 4000 ||
       !(item.timestamp === null || (Number.isInteger(item.timestamp) && item.timestamp >= 0 && item.timestamp <= 4102444800000)))) {
-      throw new Error('invalid draft');
+      throw new Error('草稿格式不正确');
     }
     messages = stored;
-  } catch { notify('无法读取本地草稿，请重新生成短信。'); }
+    if (migrate) {
+      await draftOperation('write', stored);
+      localStorage.removeItem(DRAFT_KEY);
+    }
+    $('draft-status').textContent = '草稿已从当前浏览器恢复';
+  } catch (error) {
+    $('draft-status').textContent = '草稿读取或迁移失败，请勿关闭原页面';
+    notify(`无法完整恢复本地草稿：${error.message}`);
+  }
 }
 
 function saveDraft() {
+  const revision = ++draftRevision;
   $('draft-status').textContent = '草稿保存中…';
   clearTimeout(draftTimer);
-  draftTimer = setTimeout(() => {
+  draftTimer = setTimeout(async () => {
     try {
-      localStorage.setItem(DRAFT_KEY, JSON.stringify(messages));
-      $('draft-status').textContent = '草稿已保存到当前浏览器';
+      await draftOperation('write', messages);
+      if (revision === draftRevision) $('draft-status').textContent = '草稿已保存到当前浏览器';
     } catch {
-      $('draft-status').textContent = '草稿未保存（浏览器空间不足），关闭页面会丢失修改';
+      if (revision === draftRevision) $('draft-status').textContent = '草稿未保存（浏览器空间不足或存储不可用），关闭页面会丢失修改';
     }
-  }, 500);
+  }, 800);
 }
+
+function yieldToBrowser() { return new Promise(resolve => setTimeout(resolve, 0)); }
 
 function localDate(timestamp) {
   if (!Number.isFinite(timestamp)) return '';
@@ -153,8 +190,8 @@ function updateCounts() {
   $('page-info').textContent = `第 ${page + 1} / ${totalPages} 页 · 每页 ${PAGE_SIZE} 条`;
   $('previous').disabled = page === 0;
   $('next').disabled = page + 1 >= totalPages;
-  $('add').disabled = messages.length >= MAX_COUNT;
-  $('clear').disabled = messages.length === 0;
+  $('add').disabled = !draftLoaded || generating || messages.length >= MAX_COUNT;
+  $('clear').disabled = !draftLoaded || generating || messages.length === 0;
   updateSend();
 }
 
@@ -203,9 +240,12 @@ function online(device) { return Date.now() - device.lastSeen <= 10000; }
 function updateSend() {
   const available = devices.filter(device => selected.has(device.id) && online(device)).length;
   $('selection-summary').textContent = selected.size ? `已选 ${selected.size} 台手机 · ${available} 台在线` : '请选择目标手机';
-  $('send').disabled = sending || !connected || !pendingStorageReady || !messages.length || !selected.size || selected.size !== available || Boolean(retryPayload);
-  $('send').textContent = sending ? '正在发送…' : '发送到手机';
+  $('send').disabled = !draftLoaded || sending || preparing || generating || !connected || !pendingStorageReady || !messages.length || !selected.size || selected.size !== available || Boolean(retryPayload);
+  $('send').textContent = sending ? '正在分批传输…' : preparing ? '正在校验…' : '发送到手机';
+  $('generate').disabled = !draftLoaded || generating;
+  $('generate').textContent = generating ? '正在生成…' : '随机生成并追加';
   $('retry').disabled = sending || !connected || !pendingStorageReady;
+  $('cancel-upload').disabled = sending || !connected || !pendingStorageReady;
 }
 
 function renderDevices() {
@@ -242,7 +282,7 @@ function renderJobs() {
     heading.append(element('span', 'job-title', device ? device.name : job.deviceId));
     heading.append(element('span', `badge ${job.status === 'completed' ? 'online' : ['failed', 'interrupted'].includes(job.status) ? 'error' : ''}`, labels[job.status] || job.status));
     const metadata = element('div', 'job-meta');
-    metadata.append(element('span', '', `共 ${job.count} 条 · 已确认写入 ${job.written} 条 · 未确认写入 ${job.count - job.written} 条`));
+    metadata.append(element('span', '', `共 ${job.count} 条 · ${job.batchCount || 1} 批 · 已确认写入 ${job.written} 条 · 未确认写入 ${job.count - job.written} 条`));
     metadata.append(element('span', '', new Date(job.createdAt).toLocaleString('zh-CN')));
     const progress = element('progress');
     progress.max = job.count || 1;
@@ -251,7 +291,7 @@ function renderJobs() {
     item.append(heading, metadata, progress);
     if (job.error) item.append(element('p', 'job-error', job.error));
     if (job.status === 'interrupted') item.append(element('p', 'job-error', '中断时可能已有短信写入但未反馈。请先在手机核对，避免重新发送产生重复。'));
-    item.append(element('div', 'job-id', `批次 ${job.id}`));
+    item.append(element('div', 'job-id', `任务 ${job.id}`));
     fragment.append(item);
   });
   if (!jobs.length) fragment.append(element('p', 'empty', '发送后，任务进度会显示在这里。'));
@@ -311,13 +351,56 @@ async function refreshPairing(rotate = false) {
   } finally { $('rotate').disabled = false; }
 }
 
-function validateMessages() {
-  if (!messages.length || messages.length > MAX_COUNT) throw new Error('短信数量需为 1–10000 条。');
-  messages.forEach((message, index) => {
-    if (!message.sender.trim() || [...message.sender].length > 100) throw new Error(`第 ${index + 1} 条发送人需为 1–100 个字符。`);
-    if (!message.body.trim() || [...message.body].length > 4000) throw new Error(`第 ${index + 1} 条内容需为 1–4000 个字符。`);
+function hasContent(value) { return /[^\s\u0085\u001c-\u001f]/u.test(value); }
+
+async function validateMessages(records) {
+  if (!records.length || records.length > MAX_COUNT) throw new Error('短信数量需为 1–100000 条。');
+  let bytes = 2;
+  const encoder = new TextEncoder();
+  for (let index = 0; index < records.length; index++) {
+    const message = records[index];
+    if (!hasContent(message.sender) || [...message.sender].length > 100) throw new Error(`第 ${index + 1} 条发送人需为 1–100 个字符。`);
+    if (!hasContent(message.body) || [...message.body].length > 4000) throw new Error(`第 ${index + 1} 条内容需为 1–4000 个字符。`);
     if (!Number.isInteger(message.timestamp) || message.timestamp < 0 || message.timestamp > 4102444800000) throw new Error(`第 ${index + 1} 条接收时间无效，请使用 1970–2100 年范围的时间。`);
-  });
+    bytes += encoder.encode(JSON.stringify(message)).byteLength + (index ? 1 : 0);
+    if (bytes > MAX_TASK_BYTES) throw new Error('完整列表超过 256 MiB，请减少短信数量或缩短内容。');
+    if (index % BATCH_SIZE === BATCH_SIZE - 1) await yieldToBrowser();
+  }
+}
+
+function showUploadProgress(completed, count, committing = false) {
+  $('upload-progress').hidden = false;
+  $('upload-meter').max = count;
+  $('upload-meter').value = completed;
+  $('upload-status').textContent = committing ? `已传输全部 ${count} 批，正在创建手机任务…` : `电脑传输进度：${completed} / ${count} 批（每批最多 ${BATCH_SIZE} 条）`;
+}
+
+async function uploadPayload(payload, onStarted) {
+  const batchCount = Math.ceil(payload.messages.length / BATCH_SIZE);
+  showUploadProgress(0, batchCount);
+  const upload = await (await api('/api/uploads', { method: 'POST', body: JSON.stringify({
+    requestId: payload.requestId, deviceIds: payload.deviceIds, count: payload.messages.length,
+  }) })).json();
+  onStarted();
+  if (upload.uploadId !== payload.requestId || upload.batchSize !== BATCH_SIZE || upload.batchCount !== batchCount || upload.count !== payload.messages.length) {
+    throw new Error('服务器返回的上传参数不匹配，请更新电脑服务后重试');
+  }
+  if (upload.jobs.length) { showUploadProgress(batchCount, batchCount); return { jobs: upload.jobs }; }
+  if (!Array.isArray(upload.receivedBatches) || upload.receivedBatches.some(index => !Number.isInteger(index) || index < 0 || index >= batchCount)) {
+    throw new Error('服务器返回的分批进度不正确');
+  }
+  const received = new Set(upload.receivedBatches);
+  showUploadProgress(received.size, batchCount);
+  for (let index = 0; index < batchCount; index++) {
+    if (received.has(index)) continue;
+    await api(`/api/uploads/${payload.requestId}/batches/${index}`, { method: 'POST', body: JSON.stringify({
+      messages: payload.messages.slice(index * BATCH_SIZE, (index + 1) * BATCH_SIZE),
+    }) });
+    received.add(index);
+    showUploadProgress(received.size, batchCount);
+  }
+  showUploadProgress(batchCount, batchCount, true);
+  return (await api(`/api/uploads/${payload.requestId}/commit`, { method: 'POST', body: '{}' })).json();
 }
 
 async function submitPayload(payload) {
@@ -326,6 +409,8 @@ async function submitPayload(payload) {
   notify('');
   updateSend();
   let persisted = false;
+  let uploadStarted = false;
+  let previousAttempt = false;
   try {
     const claimed = await pendingOperation('claim', payload);
     if (claimed.requestId !== payload.requestId) {
@@ -335,15 +420,19 @@ async function submitPayload(payload) {
     // Always use the committed snapshot, including on retries after a reload.
     payload = claimed;
     persisted = true;
+    previousAttempt = Boolean(payload.uploadAttempted);
+    await pendingOperation('markAttempted', payload);
     retryPayload = payload;
-    const result = await (await api('/api/jobs', { method: 'POST', body: JSON.stringify(payload) })).json();
+    const result = await uploadPayload(payload, () => { uploadStarted = true; });
+    $('upload-status').textContent = `传输完成：${payload.messages.length} 条，${Math.ceil(payload.messages.length / BATCH_SIZE)} 批。`;
     const remaining = await pendingOperation('clear', payload);
     if (remaining) showPending(remaining, '另一页面已创建待确认批次。');
     else { retryPayload = null; $('retry-box').hidden = true; }
-    notify(`已发送到 ${result.jobs.length} 台手机。请在手机端预览并确认写入。`);
+    notify(`已发送到 ${result.jobs.length} 台手机。请在手机端确认一次，依次导入全部短信；失败会停止。`);
     await refreshState();
   } catch (error) {
-    if (persisted && [400, 404, 413, 415].includes(error.httpStatus)) {
+    $('upload-status').textContent = `传输已停止：${error.message}。`;
+    if (persisted && !previousAttempt && !uploadStarted && [400, 404, 413, 415].includes(error.httpStatus)) {
       try {
         const remaining = await pendingOperation('clear', payload);
         if (remaining) showPending(remaining, '另一页面已有待确认批次。');
@@ -357,34 +446,69 @@ async function submitPayload(payload) {
   } finally { sending = false; updateSend(); }
 }
 
-$('generator').addEventListener('submit', event => {
+async function cancelPendingUpload() {
+  if (!retryPayload || sending || !pendingStorageReady) return;
+  const payload = retryPayload;
+  sending = true; updateSend();
+  try {
+    await api(`/api/uploads/${payload.requestId}/cancel`, { method: 'POST', body: '{}' });
+    const remaining = await pendingOperation('clear', payload);
+    if (remaining) showPending(remaining, '另一页面已有待确认任务。');
+    else { retryPayload = null; $('retry-box').hidden = true; }
+    $('upload-status').textContent = '已放弃未提交的上传。';
+    notify('已放弃未提交的上传，当前短信草稿保留。可以修改后重新发送。');
+  } catch (error) {
+    showPending(payload, `未能放弃上传：${error.message}。如果任务已提交，请重试发送以查询结果。`);
+  } finally { sending = false; updateSend(); }
+}
+
+$('generator').addEventListener('submit', async event => {
   event.preventDefault();
+  if (!draftLoaded || generating) return;
   const quantity = Number($('quantity').value);
-  if (!Number.isInteger(quantity) || quantity < 1 || quantity > MAX_COUNT) return notify('生成数量需为 1–10000 的整数。');
+  if (!Number.isInteger(quantity) || quantity < 1 || quantity > MAX_COUNT) return notify('生成数量需为 1–100000 的整数。');
   if (messages.length + quantity > MAX_COUNT) return notify(`列表最多 ${MAX_COUNT} 条，当前还可追加 ${MAX_COUNT - messages.length} 条。`);
   const sender = $('sender-template').value;
   const template = $('body-template').value;
-  if (sender && !sender.trim()) return notify('统一发送人不能只有空白字符。');
-  if (template && !template.trim()) return notify('短信模板不能只有空白字符。');
+  if (sender && !hasContent(sender)) return notify('统一发送人不能只有空白字符。');
+  if (template && !hasContent(template)) return notify('短信模板不能只有空白字符。');
+  generating = true; updateCounts();
   const additions = [];
-  for (let index = 1; index <= quantity; index++) {
-    const code = String(randomNumber(100000, 999999));
-    const body = template ? template.replaceAll('{code}', code).replaceAll('{index}', String(index)) : `【测试】您的验证码为 ${code}，本短信仅用于测试。序号 ${index}。`;
-    if ([...body].length > 4000) return notify(`第 ${index} 条模板展开后超过 4000 字符，请缩短内容。`);
-    additions.push({ sender: sender || `13${randomNumber(0, 9)}${String(randomNumber(0, 99999999)).padStart(8, '0')}`, body, timestamp: Date.now() - randomNumber(0, 7 * 24 * 60 * 60) * 1000 });
-  }
-  page = Math.floor(messages.length / PAGE_SIZE);
-  messages.push(...additions);
-  notify(''); saveDraft(); renderMessages();
+  const encoder = new TextEncoder();
+  let draftBytes = 2;
+  try {
+    for (let index = 0; index < messages.length; index++) {
+      draftBytes += encoder.encode(JSON.stringify(messages[index])).byteLength + (index ? 1 : 0);
+      if (index % BATCH_SIZE === BATCH_SIZE - 1) await yieldToBrowser();
+    }
+    for (let index = 1; index <= quantity; index++) {
+      const code = String(randomNumber(100000, 999999));
+      const body = template ? template.replaceAll('{code}', code).replaceAll('{index}', String(index)) : `【测试】您的验证码为 ${code}，本短信仅用于测试。序号 ${index}。`;
+      if ([...body].length > 4000) throw new Error(`第 ${index} 条模板展开后超过 4000 字符，请缩短内容。`);
+      const message = { sender: sender || `13${randomNumber(0, 9)}${String(randomNumber(0, 99999999)).padStart(8, '0')}`, body, timestamp: Date.now() - randomNumber(0, 7 * 24 * 60 * 60) * 1000 };
+      draftBytes += encoder.encode(JSON.stringify(message)).byteLength + (messages.length + additions.length ? 1 : 0);
+      if (draftBytes > MAX_TASK_BYTES) throw new Error('生成后的列表将超过 256 MiB，未追加本次内容；请减少数量或缩短模板。');
+      additions.push(message);
+      if (index % BATCH_SIZE === 0) {
+        $('generate').textContent = `正在生成 ${index} / ${quantity}…`;
+        await yieldToBrowser();
+      }
+    }
+    page = Math.floor(messages.length / PAGE_SIZE);
+    messages = messages.concat(additions);
+    notify(''); saveDraft(); renderMessages();
+  } catch (error) { notify(error.message); }
+  finally { generating = false; updateCounts(); }
 });
 $('add').addEventListener('click', () => {
-  if (messages.length >= MAX_COUNT) return;
+  if (!draftLoaded || generating || messages.length >= MAX_COUNT) return;
   messages.push({ sender: '', body: '', timestamp: Date.now() });
   page = Math.floor((messages.length - 1) / PAGE_SIZE);
   saveDraft(); renderMessages();
   $('messages').lastElementChild.querySelector('input').focus();
 });
 $('clear').addEventListener('click', () => {
+  if (!draftLoaded || generating) return;
   if (window.confirm(`清空当前 ${messages.length} 条短信草稿？已发送任务不受影响。`)) { messages = []; page = 0; saveDraft(); renderMessages(); }
 });
 $('previous').addEventListener('click', () => { if (page > 0) { page--; renderMessages(); } });
@@ -403,17 +527,21 @@ $('copy-pairing').addEventListener('click', async () => {
     $('copy-result').textContent = '自动复制不可用，请复制上方已选中的配对链接。';
   }
 });
+$('cancel-upload').addEventListener('click', () => {
+  if (retryPayload && !sending && window.confirm('放弃这次尚未提交的上传？当前短信草稿会保留。')) cancelPendingUpload();
+});
 $('retry').addEventListener('click', () => { if (retryPayload && !sending) submitPayload(retryPayload); });
-$('send').addEventListener('click', () => {
-  if (sending || retryPayload) return;
+$('send').addEventListener('click', async () => {
+  if (sending || preparing || generating || retryPayload) return;
+  preparing = true; updateSend();
   try {
-    validateMessages();
     if (!selected.size) throw new Error('请先选择目标手机。');
     if ([...selected].some(id => !devices.some(device => device.id === id && online(device)))) throw new Error('所选手机已离线，请打开手机工具或取消选择离线设备。');
     const payload = { requestId: uuid(), deviceIds: [...selected], messages: messages.map(message => ({ ...message })) };
-    if (new TextEncoder().encode(JSON.stringify(payload)).byteLength > 16 * 1024 * 1024 - 17 * 1024) throw new Error('本批数据接近 16 MiB 上限（需预留任务记录空间），请减少短信数量或缩短内容后发送。');
-    submitPayload(payload);
+    await validateMessages(payload.messages);
+    await submitPayload(payload);
   } catch (error) { notify(error.message); }
+  finally { preparing = false; updateSend(); }
 });
 
 async function initialize() {
@@ -424,11 +552,13 @@ async function initialize() {
     if (incomingToken) sessionStorage.setItem(TOKEN_KEY, incomingToken);
   } catch { token = incomingToken || ''; }
   if (incomingToken) history.replaceState(null, '', location.pathname + location.search);
-  loadDraft();
   renderMessages();
   if (!token) notify('请使用启动服务时输出的完整管理链接打开页面（包含 #token=…）。');
   try {
     await openPendingStorage();
+    await loadDraft();
+    draftLoaded = true;
+    renderMessages();
     const pending = await pendingOperation('read');
     if (pending) showPending(pending, '已恢复上次未确认的发送，请先重试原批次。');
     pendingStorageReady = true;

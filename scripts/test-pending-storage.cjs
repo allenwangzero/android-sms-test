@@ -11,15 +11,21 @@ const { indexedDB } = require(process.argv[2] || 'fake-indexeddb');
 
 const appSource = fs.readFileSync(path.join(__dirname, '../desktop/static/app.js'), 'utf8');
 const storageSource = appSource.slice(0, appSource.indexOf('\nfunction notify('));
-const submitSource = appSource.slice(appSource.indexOf('async function submitPayload('), appSource.indexOf("\n$('generator').addEventListener"));
+const draftSource = appSource.slice(appSource.indexOf('function draftOperation('), appSource.indexOf('function localDate('));
+const submitSource = appSource.slice(appSource.indexOf('function hasContent('), appSource.indexOf("\n$('generator').addEventListener"));
 assert.ok(storageSource.includes('function pendingOperation('), 'Load the actual production persistence implementation');
 
 async function tab(origin = 'http://127.0.0.1:8765', adminToken = 'admin-a') {
   const nodes = new Map();
-  const context = vm.createContext({ indexedDB, location: { origin }, structuredClone, document: {
+  const localValues = new Map();
+  const context = vm.createContext({ indexedDB, location: { origin }, structuredClone, TextEncoder, setTimeout, clearTimeout, localStorage: {
+    getItem(key) { return localValues.get(key) || null; },
+    setItem(key, value) { localValues.set(key, value); },
+    removeItem(key) { localValues.delete(key); },
+  }, document: {
     getElementById(id) { if (!nodes.has(id)) nodes.set(id, {}); return nodes.get(id); },
   } });
-  vm.runInContext(storageSource, context);
+  vm.runInContext(storageSource + draftSource, context);
   context.adminTokenForTest = adminToken;
   vm.runInContext('token = adminTokenForTest', context);
   await vm.runInContext('openPendingStorage()', context);
@@ -29,18 +35,44 @@ async function tab(origin = 'http://127.0.0.1:8765', adminToken = 'admin-a') {
     async function refreshState() {}
     let apiCallsForTest = 0;
     let rejectionStatusForTest = null;
-    async function api() {
+    let requestsForTest = [];
+    let receivedForTest = [];
+    let failPathForTest = null;
+    let uploadCountForTest = 0;
+    async function api(path, options) {
       apiCallsForTest++;
-      if (rejectionStatusForTest !== null) {
+      requestsForTest.push({ path, body: JSON.parse(options.body) });
+      if (rejectionStatusForTest !== null && (!failPathForTest || path.endsWith(failPathForTest))) {
         const failure = new Error('Simulated API error');
         if (rejectionStatusForTest !== 'network') failure.httpStatus = rejectionStatusForTest;
         throw failure;
       }
-      return { json: async () => ({ jobs: [{ id: 'created-job' }] }) };
+      if (path === '/api/uploads') {
+        const body = JSON.parse(options.body);
+        uploadCountForTest = body.count;
+        return { json: async () => ({ uploadId: body.requestId, count: body.count, batchSize: 500, batchCount: Math.ceil(body.count / 500), receivedBatches: receivedForTest, jobs: [] }) };
+      }
+      if (path.includes('/batches/')) receivedForTest.push(Number(path.split('/').pop()));
+      return { json: async () => ({ jobs: [{ id: 'created-job', count: uploadCountForTest }] }) };
     }
     pendingStorageReady = true;
   ` + submitSource, context);
   return {
+    validate(records) {
+      context.recordsForTest = records;
+      return vm.runInContext('validateMessages(recordsForTest)', context);
+    },
+    async restoreDraft(legacy = null) {
+      if (legacy) localValues.set('sms-test-draft-v1', JSON.stringify(legacy));
+      await vm.runInContext('loadDraft()', context);
+      return vm.runInContext('messages', context);
+    },
+    draft(action, value = null) {
+      context.draftActionForTest = action;
+      context.draftValueForTest = value;
+      return vm.runInContext('draftOperation(draftActionForTest, draftValueForTest)', context);
+    },
+    legacy() { return localValues.get('sms-test-draft-v1'); },
     operation(action, payload = null) {
       context.actionForTest = action;
       context.payloadForTest = payload;
@@ -51,6 +83,13 @@ async function tab(origin = 'http://127.0.0.1:8765', adminToken = 'admin-a') {
       context.statusForTest = rejectionStatus;
       return vm.runInContext('rejectionStatusForTest = statusForTest; submitPayload(payloadForTest)', context);
     },
+    cancel(status = null) { context.statusForTest = status; return vm.runInContext('rejectionStatusForTest = statusForTest; cancelPendingUpload()', context); },
+    configure({ received = [], failPath = null } = {}) {
+      context.receivedInputForTest = received;
+      context.failPathInputForTest = failPath;
+      vm.runInContext('receivedForTest = [...receivedInputForTest]; failPathForTest = failPathInputForTest', context);
+    },
+    requests() { return vm.runInContext('requestsForTest', context); },
     apiCalls() { return vm.runInContext('apiCallsForTest', context); },
     close() { vm.runInContext('pendingDatabase.close()', context); },
   };
@@ -116,7 +155,7 @@ async function run() {
     assert.equal(rejectedTab.apiCalls(), 1);
     assert.equal(await rejectedTab.operation('read'), null, `Definitive rejection ${status} must release the pending batch`);
     await rejectedTab.submit(batch(`corrected-${status}`));
-    assert.equal(rejectedTab.apiCalls(), 2, 'An edited new batch may be submitted after definitive rejection');
+    assert.equal(rejectedTab.apiCalls(), 4, 'An edited new batch may be submitted after definitive rejection');
     rejectedTab.close();
   }
   console.log('PASS: definitive 400/404/413/415 responses clear pending and permit corrected new submissions');
@@ -132,6 +171,77 @@ async function run() {
     uncertainTab.close();
   }
   console.log('PASS: 401/409/500/network failures preserve requestId and block competing new submissions');
+
+  const many = batch('many-messages');
+  many.messages = Array.from({ length: 12001 }, (_, index) => ({ sender: 'TEST', body: `短信 ${index}`, timestamp: 0 }));
+  const chunkTab = await tab('http://127.0.0.1:8765', 'chunks');
+  chunkTab.configure({ received: [0, 2, 3] });
+  await chunkTab.submit(many);
+  const requests = chunkTab.requests();
+  const chunks = requests.filter(request => request.path.includes('/batches/'));
+  assert.equal(chunks.length, 22);
+  assert.equal(chunks[0].path, '/api/uploads/many-messages/batches/1');
+  assert.equal(chunks[0].body.messages.length, 500);
+  assert.equal(chunks.at(-1).body.messages.length, 1);
+  assert.equal(requests.filter(request => request.path.endsWith('/commit')).length, 1);
+  assert.equal(await chunkTab.operation('read'), null);
+  console.log('PASS: more than 10000 records upload in 500-record chunks, skip received chunks, and commit once');
+
+  for (const status of [400, 404, 413, 415, 409, 500, 'network']) {
+    const stoppedTab = await tab('http://127.0.0.1:8765', `stopped-${status}`);
+    stoppedTab.configure({ failPath: '/batches/1' });
+    await stoppedTab.submit(many, status);
+    assert.equal(stoppedTab.requests().length, 3, 'Stop after the first failed chunk');
+    assert.equal(stoppedTab.requests().filter(request => request.path.endsWith('/commit')).length, 0);
+    assert.equal((await stoppedTab.operation('read')).messages.length, 12001);
+    assert.equal((await stoppedTab.operation('read')).uploadAttempted, true);
+    stoppedTab.configure();
+    await stoppedTab.submit(many, 404);
+    assert.equal((await stoppedTab.operation('read')).requestId, many.requestId, 'An existing upload must survive later start errors');
+    stoppedTab.configure({ received: [0] });
+    await stoppedTab.submit(many);
+    assert.equal(stoppedTab.requests().filter(request => request.path.endsWith('/batches/0')).length, 1, 'Retry must skip chunk already uploaded');
+    assert.equal(stoppedTab.requests().filter(request => request.path.endsWith('/commit')).length, 1);
+    assert.equal(await stoppedTab.operation('read'), null);
+    stoppedTab.close();
+  }
+  console.log('PASS: any mid-upload failure stops without commit, retains snapshot, and retries only missing chunks');
+  chunkTab.close();
+
+  await chunkTab.validate(many.messages);
+  await assert.rejects(chunkTab.validate([{ sender: '\u0085', body: 'test', timestamp: 0 }]), /发送人/);
+  await assert.rejects(chunkTab.validate([{ sender: 'TEST', body: '\u001c', timestamp: 0 }]), /内容/);
+  const oversized = Array.from({ length: 23000 }, () => ({ sender: 'TEST', body: '中'.repeat(4000), timestamp: 0 }));
+  await assert.rejects(chunkTab.validate(oversized), /256 MiB/);
+  console.log('PASS: validation accepts more than 10000, rejects server whitespace and UTF8 tasks above 256 MiB');
+
+  const cancelledTab = await tab('http://127.0.0.1:8765', 'cancel-upload');
+  cancelledTab.configure({ failPath: '/batches/0' });
+  await cancelledTab.submit(batch('cancel-me'), 400);
+  assert.ok(await cancelledTab.operation('read'));
+  cancelledTab.configure({ failPath: '/cancel' });
+  await cancelledTab.cancel(400);
+  assert.ok(await cancelledTab.operation('read'), 'A failed cancellation keeps the pending snapshot');
+  await cancelledTab.cancel(409);
+  assert.ok(await cancelledTab.operation('read'), 'Already committed upload cannot be cancelled');
+  cancelledTab.configure({ failPath: '/unused' });
+  await cancelledTab.cancel();
+  assert.equal(await cancelledTab.operation('read'), null);
+  cancelledTab.close();
+  console.log('PASS: cancelling a rejected upload clears pending only after server acknowledgement; 409 preserves it');
+
+  const draftTab = await tab('http://127.0.0.1:8766');
+  const legacyDraft = batch('legacy').messages;
+  assert.equal((await draftTab.restoreDraft(legacyDraft))[0].body, legacyDraft[0].body);
+  assert.equal(draftTab.legacy(), undefined, 'Remove legacy draft only after migration succeeds');
+  const hugeDraft = Array.from({ length: 100000 }, () => ({ sender: 'TEST', body: '测试草稿', timestamp: 0 }));
+  await draftTab.draft('write', hugeDraft);
+  assert.equal((await draftTab.restoreDraft()).length, 100000);
+  draftTab.close();
+  const draftReload = await tab('http://127.0.0.1:8766');
+  assert.equal((await draftReload.restoreDraft()).length, 100000);
+  draftReload.close();
+  console.log('PASS: old localStorage draft migrates safely and 100000-record IndexedDB draft survives reload');
 
   const brokenStorageTab = await tab('http://127.0.0.1:8765', 'broken-storage');
   brokenStorageTab.close();

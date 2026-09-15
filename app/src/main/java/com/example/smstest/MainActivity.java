@@ -86,12 +86,12 @@ public final class MainActivity extends ComponentActivity {
         roleStatus = text(layout);
         makeDefault = button(layout, "2. 临时设为默认短信应用", this::requestDefault);
         status = text(layout);
-        confirm = button(layout, "3. 确认写入本批短信", () -> {
+        confirm = button(layout, "3. 确认写入完整任务", () -> {
             LanClient.Job job = client.getJob();
             if (job == null || client.isBusy()) return;
             if (!isDefault()) { showMessage("请先设为默认短信应用"); return; }
-            new AlertDialog.Builder(this).setTitle("确认写入 " + job.messages.size() + " 条短信")
-                    .setMessage("这些记录将追加到系统收件箱。确认短信内容和发送人后继续。")
+            new AlertDialog.Builder(this).setTitle("确认写入 " + job.count + " 条短信")
+                    .setMessage("这些记录将追加到系统收件箱。确认一次后每 500 条自动分批导入；请保持前台，失败或离开前台即停止，不会自动续写。")
                     .setNegativeButton("返回检查", null)
                     .setPositiveButton("写入", (dialog, which) -> client.confirm(job.id)).show();
         });
@@ -185,10 +185,10 @@ public final class MainActivity extends ComponentActivity {
             previewId = nextId;
             if (job == null) preview.setText("");
             else {
-                StringBuilder content = new StringBuilder("本批共 " + job.messages.size() + " 条 · 预览前 20 条\n");
+                StringBuilder content = new StringBuilder("任务共 " + job.count + " 条 · " + job.batchCount + " 批 · 预览前 20 条\n");
                 DateFormat format = DateFormat.getDateTimeInstance();
-                for (int i = 0; i < Math.min(20, job.messages.size()); i++) {
-                    SmsRecord record = job.messages.get(i);
+                for (int i = 0; i < job.preview.size(); i++) {
+                    SmsRecord record = job.preview.get(i);
                     content.append("\n").append(i + 1).append(". ").append(record.sender)
                             .append("\n").append(format.format(new Date(record.timestamp)))
                             .append("\n").append(record.body).append("\n");
@@ -210,9 +210,13 @@ public final class MainActivity extends ComponentActivity {
         handler.post(refresh);
     }
 
+    @Override protected void onStop() {
+        if (!isChangingConfigurations()) client.setForeground(false);
+        super.onStop();
+    }
+
     @Override protected void onPause() {
         handler.removeCallbacks(refresh);
-        client.setForeground(false);
         super.onPause();
     }
 }

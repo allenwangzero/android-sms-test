@@ -32,6 +32,7 @@ public final class LanClient {
     private String deviceId;
     private volatile boolean foreground;
     private volatile boolean busy;
+    private volatile boolean stopped;
     private volatile Job current;
     private volatile String connection = "未连接电脑";
     private volatile String result = "扫码连接电脑，然后在电脑发送短信列表。";
@@ -39,10 +40,14 @@ public final class LanClient {
 
     public static final class Job {
         public final String id;
-        public final List<SmsRecord> messages;
-        Job(String id, List<SmsRecord> messages) {
+        public final int count;
+        public final int batchCount;
+        public final List<SmsRecord> preview;
+        Job(String id, int count, List<SmsRecord> preview) {
             this.id = id;
-            this.messages = Collections.unmodifiableList(messages);
+            this.count = count;
+            this.batchCount = (count + BatchImporter.BATCH_SIZE - 1) / BatchImporter.BATCH_SIZE;
+            this.preview = Collections.unmodifiableList(preview);
         }
     }
 
@@ -74,7 +79,10 @@ public final class LanClient {
         return instance;
     }
 
-    public void setForeground(boolean value) { foreground = value; }
+    public void setForeground(boolean value) {
+        foreground = value;
+        if (!value && busy) stopped = true;
+    }
     public boolean isBusy() { return busy || storageBlocked; }
     public boolean isWorking() { return busy; }
     public Job getJob() { return current; }
@@ -175,35 +183,46 @@ public final class LanClient {
             Job job = parseJob(id, raw);
             report(id, ledger("received", 0, ""));
             current = job;
-            result = "已收到 " + job.messages.size() + " 条，检查预览后在手机确认写入。";
+            result = "已收到 " + job.count + " 条，共 " + job.batchCount + " 批；确认一次后依次导入。";
         } catch (Exception error) {
             connection = "连接或同步失败，将重试：" + error.getMessage();
         }
     }
 
     private Job parseJob(String id, JSONObject raw) throws Exception {
-        JSONArray array = raw.getJSONArray("messages");
-        if (array.length() < 1 || array.length() > 10000 || array.length() != raw.getInt("count")) {
-            throw new IOException("任务短信数量无效");
+        if (!raw.has("batchSize") || !raw.has("batchCount") || !raw.has("preview")) {
+            throw new IOException("电脑端协议不兼容，请升级电脑端和手机 App 至 1.1.0 或更新版本");
         }
+        int count = integer(raw, "count");
+        if (count < 1 || count > 100000 || integer(raw, "batchSize") != BatchImporter.BATCH_SIZE
+                || integer(raw, "batchCount") != (count + 499) / 500) {
+            throw new IOException("任务分批信息无效，请升级电脑端和手机 App");
+        }
+        List<SmsRecord> preview = parseRecords(raw.getJSONArray("preview"), Math.min(20, count));
+        return new Job(id, count, preview);
+    }
+
+    private int integer(JSONObject object, String name) throws Exception {
+        Object value = object.get(name);
+        if (!(value instanceof Integer || value instanceof Long)) throw new IOException("整数类型无效：" + name);
+        long number = ((Number) value).longValue();
+        if (number < 0 || number > Integer.MAX_VALUE) throw new IOException("整数范围无效：" + name);
+        return (int) number;
+    }
+
+    private List<SmsRecord> parseRecords(JSONArray array, int expected) throws Exception {
+        if (array.length() != expected) throw new IOException("分批短信数量不匹配");
         List<SmsRecord> records = new ArrayList<>();
         for (int i = 0; i < array.length(); i++) {
             JSONObject item = array.getJSONObject(i);
-            Object senderValue = item.get("sender");
-            Object bodyValue = item.get("body");
-            Object timeValue = item.get("timestamp");
-            if (!(senderValue instanceof String) || !(bodyValue instanceof String)
-                    || !(timeValue instanceof Long || timeValue instanceof Integer)) throw new IOException("短信字段类型无效");
-            String sender = (String) senderValue;
-            String body = (String) bodyValue;
-            long timestamp = ((Number) timeValue).longValue();
-            if (sender.trim().isEmpty() || sender.codePointCount(0, sender.length()) > 100 || body.trim().isEmpty()
-                    || body.codePointCount(0, body.length()) > 4000 || timestamp < 0 || timestamp > 4102444800000L) {
-                throw new IOException("第 " + (i + 1) + " 条短信内容无效");
-            }
-            records.add(new SmsRecord(sender, body, timestamp));
+            Object sender = item.get("sender"), body = item.get("body"), timestamp = item.get("timestamp");
+            if (!(sender instanceof String) || !(body instanceof String)
+                    || !(timestamp instanceof Long || timestamp instanceof Integer)) throw new IOException("短信字段类型无效");
+            SmsRecord record = new SmsRecord((String) sender, (String) body, ((Number) timestamp).longValue());
+            BatchImporter.validate(record);
+            records.add(record);
         }
-        return new Job(id, records);
+        return records;
     }
 
     public void confirm(String jobId) {
@@ -214,48 +233,53 @@ public final class LanClient {
         Job job = current;
         if (storageBlocked || job == null || !job.id.equals(jobId) || prefs.contains(key(jobId))) return;
         busy = true;
-        int written = 0;
-        String status = "completed";
-        String errorText = "";
-        try {
-            save(key(job.id), ledger("writing", 0, "").toString());
-            report(job.id, ledger("writing", 0, ""));
-            boolean reportProgress = true;
-            for (SmsRecord record : job.messages) {
-                SmsWriter.insert(context, record);
-                written++;
-                // Provider and preferences cannot be committed atomically. A crash may leave one
-                // insertion uncounted; the durable writing marker prevents replay of the batch.
-                save(key(job.id), ledger("writing", written, "").toString());
-                result = "正在写入 " + written + " / " + job.messages.size() + "，请保持前台。";
-                if (reportProgress && written % 25 == 0) {
-                    try { report(job.id, ledger("writing", written, "")); }
-                    catch (IOException ignored) {
-                        reportProgress = false;
-                        connection = "网络中断，写入结果稍后回传";
-                    }
-                }
+        stopped = !foreground;
+        BatchImporter.Outcome outcome = BatchImporter.run(job.count, new BatchImporter.Operations() {
+            @Override public void checkActive() throws IOException {
+                if (stopped) throw new IOException("应用已离开前台，任务停止；不会自动续写");
             }
-        } catch (Exception error) {
-            status = "failed";
-            errorText = error.getClass().getSimpleName() + "：" + error.getMessage();
-        }
+            @Override public List<SmsRecord> fetch(int index, int offset, int expected) throws Exception {
+                JSONObject raw = http(baseUrl, token, "/api/device/jobs/" + job.id + "/batches/" + index, null);
+                if (!job.id.equals(raw.getString("jobId")) || integer(raw, "index") != index
+                        || integer(raw, "offset") != offset || integer(raw, "total") != job.count) {
+                    throw new IOException("分批任务标识或顺序不匹配");
+                }
+                return parseRecords(raw.getJSONArray("messages"), expected);
+            }
+            @Override public void insert(SmsRecord record) throws Exception { SmsWriter.insert(context, record); }
+            @Override public void persist(int written) throws Exception {
+                // Provider and preferences are not atomic: never replay after an interrupted commit.
+                save(key(job.id), ledger("writing", written, "").toString());
+            }
+            @Override public void report(int written) throws Exception {
+                LanClient.this.report(job.id, ledger("writing", written, ""));
+            }
+            @Override public void progress(int written, int batchIndex) {
+                result = "正在写入 " + written + " / " + job.count + " 条 · 第 "
+                        + (batchIndex + 1) + " / " + job.batchCount + " 批，请保持前台。";
+            }
+        });
+        int written = outcome.written;
+        String status = outcome.error == null ? "completed" : "failed";
+        String errorText = outcome.error == null ? "" : outcome.error.getClass().getSimpleName() + "：" + outcome.error.getMessage();
         try {
             save(key(job.id), ledger(status, written, errorText).toString());
-            current = null;
-            result = "本批成功写入 " + written + " / " + job.messages.size() + " 条。"
-                    + (errorText.isEmpty() ? "" : "\n" + errorText)
-                    + "\n请恢复原短信应用查看收件箱；结果等待同步电脑。";
+        } catch (Exception error) {
+            // A failed commit may still update the in-memory preferences map. Do not infer
+            // durability by reading it back, and never accept another task in this process.
+            blockStorage(error);
+            busy = false;
+            return;
+        }
+        current = null;
+        result = "任务已" + (outcome.error == null ? "完成" : "停止") + "，成功写入 " + written + " / " + job.count + " 条。"
+                + (errorText.isEmpty() ? "" : "\n" + errorText)
+                + "\n请恢复原短信应用查看收件箱；结果等待同步电脑。";
+        try {
             flushResults();
         } catch (Exception error) {
-            if (!prefs.contains(key(job.id)) || "writing".equals(readStatus(job.id))) blockStorage(error);
-            else connection = "结果待回传：" + error.getMessage();
+            connection = "结果待回传：" + error.getMessage();
         } finally { busy = false; }
-    }
-
-    private String readStatus(String id) {
-        try { return new JSONObject(prefs.getString(key(id), "{}")).optString("status"); }
-        catch (JSONException error) { return "writing"; }
     }
 
     private String key(String id) { return "job:" + baseUrl + ":" + deviceId + ":" + id; }
@@ -300,6 +324,7 @@ public final class LanClient {
         connection.setConnectTimeout(5000);
         connection.setReadTimeout(10000);
         connection.setRequestProperty("Accept", "application/json");
+        connection.setRequestProperty("X-SMS-Protocol", "2");
         if (!bearer.isEmpty()) connection.setRequestProperty("Authorization", "Bearer " + bearer);
         try {
             if (data != null) {
