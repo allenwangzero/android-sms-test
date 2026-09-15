@@ -12,7 +12,7 @@ const { indexedDB } = require(process.argv[2] || 'fake-indexeddb');
 const appSource = fs.readFileSync(path.join(__dirname, '../desktop/static/app.js'), 'utf8');
 const storageSource = appSource.slice(0, appSource.indexOf('\nfunction notify('));
 const draftSource = appSource.slice(appSource.indexOf('function draftOperation('), appSource.indexOf('function localDate('));
-const submitSource = appSource.slice(appSource.indexOf('function hasContent('), appSource.indexOf("\n$('generator').addEventListener"));
+const submitSource = appSource.slice(appSource.indexOf('function hasContent('), appSource.indexOf("\nasync function importXmlFile("));
 assert.ok(storageSource.includes('function pendingOperation('), 'Load the actual production persistence implementation');
 
 async function tab(origin = 'http://127.0.0.1:8765', adminToken = 'admin-a') {

@@ -1,0 +1,68 @@
+'use strict';
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const { JSDOM } = require(process.argv[2] || 'jsdom');
+const root = path.join(__dirname, '..');
+const dom = new JSDOM(fs.readFileSync(path.join(root, 'desktop/static/index.html'), 'utf8'), {
+  url: 'http://localhost:8765', runScripts: 'outside-only',
+});
+const w = dom.window;
+const evaluate = source => require('node:vm').runInContext(source, dom.getInternalVMContext());
+w.TextEncoder = TextEncoder;
+evaluate(fs.readFileSync(path.join(root, 'desktop/static/sms-xml.js'), 'utf8'));
+const record = '<sms address="Maya" body="hello" date="1789281245486" type="1"/>';
+const xml = (rows, count = '') => `<smses${count}>${rows}</smses>`;
+function reject(source, pattern) { assert.throws(() => w.parseSmsXml(source), pattern); }
+async function main() {
+  const parsed = w.parseSmsXml(xml(record + record, ' count="2"'));
+  assert.equal(parsed.length, 2);
+  assert.equal(parsed[0].sender, 'Maya');
+  assert.equal(parsed[0].timestamp, 1789281245486);
+  assert.equal(w.parseSmsXml(xml(record.replace('hello', ' A&amp;B &lt;tag&gt;&#10;😀 ')))[0].body, ' A&B <tag>\n😀 ');
+  assert.equal(w.parseSmsXml('<?xml version="1.0" encoding="UTF-8"?>' + xml(record))[0].body, 'hello');
+  for (const bad of ['', '<smses>', '<root/>', xml('<mms/>'), '<!DOCTYPE smses>' + xml(record), '<?test x?>' + xml(record), xml(record, ' count="2000"'), xml(record.replace('type="1"', 'type="2"')), xml(record.replace('address="Maya"', '')), xml(record.replace('hello', '&#133; ')), xml(record.replace('1789281245486', '1e3')), xml(record.replace('1789281245486', '4102444800001')), xml(record.replace('hello', 'a'.repeat(4001)))]) reject(bad, /XML|短信|第 1/);
+  const bulk = w.parseSmsXml(xml(record.repeat(2000), ' count="2000"'));
+  assert.equal(bulk.length, 2000);
+  assert.equal(w.parseSmsXml(xml(record.replace('Maya', '😀'.repeat(100)))).length, 1);
+  reject(xml(record.replace('Maya', '😀'.repeat(101))), /发送人/);
+  let source = fs.readFileSync(path.join(root, 'desktop/static/app.js'), 'utf8');
+  source = source.replace(/\ninitialize\(\);\s*$/, '\n');
+  evaluate(source);
+  evaluate(`draftLoaded = true; let writesForTest = []; let failForTest = false;
+    draftOperation = async (action, value) => { if (failForTest) throw new Error('storage full'); writesForTest.push(value); };
+    saveDraft = () => {};`);
+  const upload = (text, name = 'test.xml', size = 100) => w.importXmlFile({ name, size, text: async () => text });
+  await upload(xml(record));
+  assert.equal(evaluate('messages.length'), 1);
+  assert.equal(w.document.querySelector('#messages input').value, 'Maya');
+  await upload(xml(record.repeat(2000)));
+  assert.equal(evaluate('messages.length'), 2001);
+  assert.match(w.document.getElementById('notice').textContent, /追加 2000/);
+  await upload(xml(record.replace('type="1"', 'type="2"')));
+  assert.equal(evaluate('messages.length'), 2001);
+  assert.match(w.document.getElementById('notice').textContent, /原列表未改动/);
+  await upload(xml(record), 'big.xml', 64 * 1024 * 1024 + 1);
+  assert.equal(evaluate('messages.length'), 2001);
+  evaluate('failForTest = true');
+  await upload(xml(record));
+  assert.equal(evaluate('messages.length'), 2001);
+  assert.match(w.document.getElementById('notice').textContent, /storage full/);
+  evaluate('failForTest = false');
+  let finish;
+  const held = w.importXmlFile({ name: 'held.xml', size: 100, text: () => new Promise(resolve => { finish = resolve; }) });
+  assert.equal(w.document.getElementById('import-xml').disabled, true);
+  assert.equal(w.document.querySelector('#messages input').disabled, true);
+  await upload(xml(record));
+  finish(xml(record));
+  await held;
+  assert.equal(evaluate('messages.length'), 2002);
+  assert.equal(w.document.getElementById('import-xml').disabled, false);
+  evaluate('messages = Array.from({length: 100000}, () => ({sender:"A",body:"B",timestamp:0}))');
+  await upload(xml(record));
+  assert.equal(evaluate('messages.length'), 100000);
+  assert.match(w.document.getElementById('notice').textContent, /超过 100000/);
+  console.log('XML parser and import UI: validation, entities, 2000 records, atomic append, limits, storage failure and concurrent import passed');
+  dom.window.close();
+}
+main().catch(error => { console.error(error); dom.window.close(); process.exitCode = 1; });

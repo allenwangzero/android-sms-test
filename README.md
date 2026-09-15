@@ -6,7 +6,7 @@
 
 1. 电脑启动本地服务，打开终端打印的管理页面链接。
 2. 安卓工具扫描电脑页面上的配对二维码。电脑与手机需要在可互相访问的同一局域网。
-3. 在电脑指定数量随机生成短信，或新增、编辑每条短信的发送人、正文、接收时间。
+3. 在电脑随机生成短信，或点击“上传 XML 并追加”导入短信文件，再编辑发送人、正文和接收时间。XML 支持 `<smses><sms address="发送人" body="内容" date="毫秒时间戳" type="1" /></smses>` 格式，仅支持收件短信。保留原顺序与内容，全部校验通过并保存后才追加；失败不改动原列表。单文件最多 64 MiB，列表最多 100,000 条。XML 在浏览器解析，点击发送后按原流程分批传输，无需更新 v1.1.0 APK。
 4. 选择一台或多台已配对手机，点击发送；电脑按 500 条一批上传完整列表快照，全部上传完成后才创建手机任务。
 5. 手机上检查预览、总条数和批次数，临时设为默认短信应用。只需确认一次，手机就会逐批下载并按原顺序写入，无需每批重复确认。
 6. 电脑和手机显示累计写入进度。任何一批下载、写入或进度同步失败都会停止整个任务，已写入的短信保留。完成后在手机恢复原来的默认短信应用，再用原短信 App 查看。
@@ -127,8 +127,9 @@ sh scripts/test.sh
 浏览器批次持久化的开发测试（Node 仅用于测试，不是电脑服务的运行依赖）：
 
 ```sh
-npm install --prefix /tmp/sms-pending-test --ignore-scripts --no-audit --no-fund fake-indexeddb@6.2.5
+npm install --prefix /tmp/sms-pending-test --ignore-scripts --no-audit --no-fund fake-indexeddb@6.2.5 jsdom@26.1.0
 node scripts/test-pending-storage.cjs /tmp/sms-pending-test/node_modules/fake-indexeddb
+node scripts/test-xml-import.cjs /tmp/sms-pending-test/node_modules/jsdom
 ```
 
 电脑端自动化检查覆盖认证、配对、多设备任务、分块上传、请求幂等、状态和数量校验、持久化。浏览器测试覆盖并发页面、刷新恢复、缺块重传和失败停止。纯 Java 测试覆盖手机配对地址校验、顺序批次执行和失败停止，无需 SDK。Android 原生编译与 lint、Docker 镜像启动与接口测试由 CI 执行。

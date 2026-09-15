@@ -17,6 +17,7 @@ let connected = false;
 let sending = false;
 let preparing = false;
 let generating = false;
+let importing = false;
 let draftRevision = 0;
 let draftLoaded = false;
 let retryPayload = null;
@@ -190,8 +191,10 @@ function updateCounts() {
   $('page-info').textContent = `第 ${page + 1} / ${totalPages} 页 · 每页 ${PAGE_SIZE} 条`;
   $('previous').disabled = page === 0;
   $('next').disabled = page + 1 >= totalPages;
-  $('add').disabled = !draftLoaded || generating || messages.length >= MAX_COUNT;
-  $('clear').disabled = !draftLoaded || generating || messages.length === 0;
+  $('import-xml').disabled = !draftLoaded || generating || importing;
+  $('import-xml').textContent = importing ? '正在解析 XML…' : '上传 XML 并追加';
+  $('add').disabled = !draftLoaded || generating || importing || messages.length >= MAX_COUNT;
+  $('clear').disabled = !draftLoaded || generating || importing || messages.length === 0;
   updateSend();
 }
 
@@ -205,6 +208,7 @@ function renderMessages() {
     for (const field of ['sender', 'body', 'timestamp']) {
       const cell = element('td');
       const input = element(field === 'body' ? 'textarea' : 'input');
+      input.disabled = importing;
       input.setAttribute('aria-label', `第 ${index + 1} 条${{ sender: '发送人', body: '短信内容', timestamp: '接收时间' }[field]}`);
       if (field === 'timestamp') {
         input.type = 'datetime-local';
@@ -215,6 +219,7 @@ function renderMessages() {
         input.value = message[field];
       }
       input.addEventListener('input', () => {
+        if (importing) return;
         message[field] = field === 'timestamp' ? (input.value ? new Date(input.value).getTime() : null) : input.value;
         saveDraft();
       });
@@ -223,9 +228,10 @@ function renderMessages() {
     }
     const removeCell = element('td');
     const remove = element('button', 'remove-row', '×');
+    remove.disabled = importing;
     remove.title = `删除第 ${index + 1} 条`;
     remove.setAttribute('aria-label', remove.title);
-    remove.addEventListener('click', () => { messages.splice(index, 1); saveDraft(); renderMessages(); });
+    remove.addEventListener('click', () => { if (importing) return; messages.splice(index, 1); saveDraft(); renderMessages(); });
     removeCell.append(remove);
     row.append(removeCell);
     fragment.append(row);
@@ -240,9 +246,9 @@ function online(device) { return Date.now() - device.lastSeen <= 10000; }
 function updateSend() {
   const available = devices.filter(device => selected.has(device.id) && online(device)).length;
   $('selection-summary').textContent = selected.size ? `已选 ${selected.size} 台手机 · ${available} 台在线` : '请选择目标手机';
-  $('send').disabled = !draftLoaded || sending || preparing || generating || !connected || !pendingStorageReady || !messages.length || !selected.size || selected.size !== available || Boolean(retryPayload);
+  $('send').disabled = !draftLoaded || sending || preparing || generating || importing || !connected || !pendingStorageReady || !messages.length || !selected.size || selected.size !== available || Boolean(retryPayload);
   $('send').textContent = sending ? '正在分批传输…' : preparing ? '正在校验…' : '发送到手机';
-  $('generate').disabled = !draftLoaded || generating;
+  $('generate').disabled = !draftLoaded || generating || importing;
   $('generate').textContent = generating ? '正在生成…' : '随机生成并追加';
   $('retry').disabled = sending || !connected || !pendingStorageReady;
   $('cancel-upload').disabled = sending || !connected || !pendingStorageReady;
@@ -462,9 +468,45 @@ async function cancelPendingUpload() {
   } finally { sending = false; updateSend(); }
 }
 
+async function importXmlFile(file) {
+  if (!file || !draftLoaded || generating || importing) return;
+  importing = true;
+  renderMessages();
+  try {
+    if (file.size > 64 * 1024 * 1024) throw new Error('XML 文件超过 64 MiB，请拆分后导入。');
+    const additions = parseSmsXml(await file.text());
+    if (messages.length + additions.length > MAX_COUNT) throw new Error(`追加后超过 ${MAX_COUNT} 条，当前还可追加 ${MAX_COUNT - messages.length} 条。`);
+    const combined = messages.concat(additions);
+    const encoder = new TextEncoder();
+    let bytes = 2;
+    for (let index = 0; index < combined.length; index++) {
+      bytes += encoder.encode(JSON.stringify(combined[index])).byteLength + (index ? 1 : 0);
+      if (bytes > MAX_TASK_BYTES) throw new Error('追加后的列表超过 256 MiB，请减少短信数量。');
+      if (index % BATCH_SIZE === BATCH_SIZE - 1) await yieldToBrowser();
+    }
+    clearTimeout(draftTimer);
+    await draftOperation('write', combined);
+    draftRevision++;
+    page = Math.floor(messages.length / PAGE_SIZE);
+    messages = combined;
+    $('draft-status').textContent = '草稿已保存到当前浏览器';
+    notify(`已从 ${file.name} 追加 ${additions.length} 条短信，合计 ${messages.length} 条。请检查列表后发送到手机。`);
+  } catch (error) {
+    saveDraft();
+    notify(`XML 导入失败，原列表未改动：${error.message}`);
+  } finally {
+    importing = false;
+    $('xml-file').value = '';
+    renderMessages();
+  }
+}
+
+$('import-xml').addEventListener('click', () => { if (draftLoaded && !generating && !importing) $('xml-file').click(); });
+$('xml-file').addEventListener('change', () => importXmlFile($('xml-file').files[0]));
+
 $('generator').addEventListener('submit', async event => {
   event.preventDefault();
-  if (!draftLoaded || generating) return;
+  if (!draftLoaded || generating || importing) return;
   const quantity = Number($('quantity').value);
   if (!Number.isInteger(quantity) || quantity < 1 || quantity > MAX_COUNT) return notify('生成数量需为 1–100000 的整数。');
   if (messages.length + quantity > MAX_COUNT) return notify(`列表最多 ${MAX_COUNT} 条，当前还可追加 ${MAX_COUNT - messages.length} 条。`);
@@ -501,14 +543,14 @@ $('generator').addEventListener('submit', async event => {
   finally { generating = false; updateCounts(); }
 });
 $('add').addEventListener('click', () => {
-  if (!draftLoaded || generating || messages.length >= MAX_COUNT) return;
+  if (!draftLoaded || generating || importing || messages.length >= MAX_COUNT) return;
   messages.push({ sender: '', body: '', timestamp: Date.now() });
   page = Math.floor((messages.length - 1) / PAGE_SIZE);
   saveDraft(); renderMessages();
   $('messages').lastElementChild.querySelector('input').focus();
 });
 $('clear').addEventListener('click', () => {
-  if (!draftLoaded || generating) return;
+  if (!draftLoaded || generating || importing) return;
   if (window.confirm(`清空当前 ${messages.length} 条短信草稿？已发送任务不受影响。`)) { messages = []; page = 0; saveDraft(); renderMessages(); }
 });
 $('previous').addEventListener('click', () => { if (page > 0) { page--; renderMessages(); } });
@@ -532,7 +574,7 @@ $('cancel-upload').addEventListener('click', () => {
 });
 $('retry').addEventListener('click', () => { if (retryPayload && !sending) submitPayload(retryPayload); });
 $('send').addEventListener('click', async () => {
-  if (sending || preparing || generating || retryPayload) return;
+  if (sending || preparing || generating || importing || retryPayload) return;
   preparing = true; updateSend();
   try {
     if (!selected.size) throw new Error('请先选择目标手机。');
